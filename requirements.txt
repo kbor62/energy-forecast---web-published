@@ -1,0 +1,15 @@
+# Versions used for the reported results (see README.md, section 1).
+pandas==3.0.6
+numpy==2.5.3
+scikit-learn==1.9.1
+lightgbm==4.7.0
+
+# Required by the pipeline; any recent version works.
+pyarrow
+matplotlib
+joblib
+scipy
+python-dotenv
+
+# Only needed for src/fetch_prices.py (step 1).
+entsoe-py

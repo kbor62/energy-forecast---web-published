@@ -1,0 +1,44 @@
+{
+  "horizon_hours": 3,
+  "target": "target_price_t+3",
+  "model": "ridge_ohe",
+  "encoding": "both",
+  "train_samples": 58074,
+  "val_samples": 719,
+  "val_start": "2026-08-23 22:00:00+02:00",
+  "train_end": "2026-08-23 19:00:00+02:00",
+  "embargo_hours": 3,
+  "train_metrics": {
+    "n": 58074,
+    "mae": 0.010462433150076061,
+    "rmse": 0.018943209430613197,
+    "nmae": 0.13623183911732586
+  },
+  "val_metrics": {
+    "n": 719,
+    "mae": 0.013605082352063558,
+    "rmse": 0.020436863102041583,
+    "nmae": 0.11035133949317631
+  },
+  "prediction_intervals": {
+    "pi_80": {
+      "lower": -0.0184269268008103,
+      "upper": 0.021269419174637084
+    },
+    "method": "empirical quantiles of validation residuals (y - yhat)",
+    "n_residuals": 719
+  },
+  "fit_info": {
+    "n_train_rows": 58074,
+    "alpha": 1.7782794100389228
+  },
+  "seed": 42,
+  "library_versions": {
+    "python": "3.14.2",
+    "pandas": "3.0.6",
+    "numpy": "2.5.3",
+    "scikit-learn": "1.9.1",
+    "lightgbm": "4.7.0"
+  },
+  "units": "EUR/kWh"
+}
