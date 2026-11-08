@@ -19,7 +19,7 @@ BRUSSELS_TZ = "Europe/Brussels"  # time zone used by the ENTSO-E API
 PRICE_COL = "price_EUR_per_kWh"
 TIMESTAMP_COL = "timestamp"
 
-# Reporting rate (18 Sep 2026). Models train on EUR/kWh; NOK is for display only.
+# Display rate (18 Sep 2026). Models train on EUR/kWh; NOK is for display only.
 EUR_TO_NOK = 10.83
 
 # ENTSO-E API token (free from https://transparency.entsoe.eu/), read from .env.

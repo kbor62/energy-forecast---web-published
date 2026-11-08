@@ -1,4 +1,4 @@
-# Versions used for the reported results (see README.md, section 1).
+# Versions used for the results in README.md section 11 (see section 1).
 pandas==3.0.6
 numpy==2.5.3
 scikit-learn==1.9.1

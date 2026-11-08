@@ -1,15 +1,15 @@
 ===============================================================================
  REPRODUCING ALL DATA, MODELS, FORECASTS AND FIGURES
- Electricity Price Forecasting Using Machine Learning (NO1) - Kjetil Borg
- State as of 22 September 2026 (price-only results); weather extension
- added 6 November 2026 (section 13)
+ Electricity price forecasting for NO1 (Norway) - Kjetil Borg
+ Price-only results as of 22 September 2026; weather extension added in
+ November 2026 (sections 13-14)
 ===============================================================================
 
 This file lists, step by step, how every data file, model, forecast, figure and
-table that the project report relies on was produced, and how to produce them
-again. All commands are run from the repository root in a terminal with the
-virtual environment activated. Commands shown with "python" assume the venv's
-python (.\.venv\Scripts\python.exe on Windows).
+table of the project is produced, and how to produce them again. All commands
+are run from the repository root in a terminal with the virtual environment
+activated. Commands shown with "python" assume the venv's python
+(.\.venv\Scripts\python.exe on Windows).
 
 Contents
   0. What "reproduce" means here (two modes)
@@ -23,7 +23,7 @@ Contents
   7. Step 8 - Statistical tests
   8. Step 9 - Feature importance
   9. Step 10 - Automated tests
- 10. Where each figure and table in the report comes from
+ 10. Outputs and the step that produces them
  11. Reference values for checking a reproduction
  12. Numbers computed from the backtest CSVs
  13. Weather extension: observed weather, forecast snapshots, pipeline flag
@@ -33,7 +33,7 @@ Contents
 0. WHAT "REPRODUCE" MEANS HERE (TWO MODES)
 -------------------------------------------------------------------------------
 
-Mode A - exact reproduction (recommended for checking the report)
+Mode A - exact reproduction (recommended for checking a reproduction)
   Use the price file from 21 Sep 2026 (84,666 rows, 2020-01-01 00:00 to
   2026-09-22 23:45, fetched 21 Sep 2026 13:39). Results are not versioned
   (data\, models\ and figs\ are git-ignored), but this one file is still in the
@@ -82,7 +82,7 @@ you can always run the steps individually as described below.
 1. ENVIRONMENT
 -------------------------------------------------------------------------------
 
-1.1 Python and libraries used for the reported results (recorded in every
+1.1 Python and libraries used for the results in section 11 (recorded in every
     model's *_meta.json):
 
       python        3.14.2
@@ -109,11 +109,11 @@ you can always run the steps individually as described below.
 2. CONFIGURATION  (src\config.py)
 -------------------------------------------------------------------------------
 
-  EUR_TO_NOK   = 10.83     reporting rate of 18 Sep 2026. Only scales NOK
+  EUR_TO_NOK   = 10.83     display rate of 18 Sep 2026. Only scales NOK
                            figures; models train on EUR/kWh.
   TZ           = "Europe/Oslo"
 
-  Keep EUR_TO_NOK at 10.83 to reproduce the NOK numbers in the report.
+  Keep EUR_TO_NOK at 10.83 to reproduce the NOK numbers in section 11.
 
   The ENTSO-E API token is NOT stored in config.py. It is read from a .env
   file in the repository root (only needed for step 1):
@@ -161,7 +161,7 @@ Step 2 - features (once):
 
   python src/build_features.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --out data/features_price_only.parquet --horizon 48
 
-Steps 3-5 for the four variants used in the report:
+Steps 3-5 for the four variants compared in section 11:
 
   lgbm_int:
     python src/train.py --inp data/features_price_only.parquet --model lgbm --encoding int --horizon 48 --val_days 30
@@ -186,8 +186,7 @@ Steps 3-5 for the four variants used in the report:
 Every variant must use the same price file. In Mode B, run step 1 first and do
 not download again between variants.
 
-The reported results were produced by these same commands, run through a
-Python wrapper script included in the repository as run_pipeline.py.
+The same steps can be run with the wrapper script run_pipeline.py.
 
 Backtest settings used:
   origins 2026-01-01 00:00 .. 2026-08-29 01:00, step 48 h -> 121 origins
@@ -212,7 +211,7 @@ Training settings:
   Output:
     figs\eda\eda_timeseries.png, eda_distribution.png, eda_by_hour.png,
             eda_by_month.png, eda_heatmap.png, eda_acf.png, eda_outliers.png
-    data\eda_summary_by_year.csv   (annual statistics, report Table 2)
+    data\eda_summary_by_year.csv   (annual statistics)
     data\eda_outliers.csv          (flagged hours)
     data\eda_meta.json             (settings and headline numbers)
 
@@ -225,7 +224,7 @@ Training settings:
 
   python src/backtest_rolling.py --compare data/backtest_rolling_lgbm_int.csv data/backtest_rolling_ridge_ohe_both.csv data/backtest_rolling_ridge_trig.csv
 
-  Output: figs\compare_by_horizon.png  (report Figure 5)
+  Output: figs\compare_by_horizon.png
   Prints aggregate MAE / nMAE per model and both baselines.
 
 
@@ -248,7 +247,7 @@ Training settings:
   python src/stat_tests.py data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv
 
   Output: pairwise tables (CSV); Friedman ranks and p-values are printed to
-  the console (report Table 6).
+  the console.
 
 
 -------------------------------------------------------------------------------
@@ -264,7 +263,7 @@ Training settings:
   Output:
     data\feature_importance_<model>.csv          per feature and horizon
     data\feature_importance_groups_<model>.csv   per feature group
-    figs\importance\feature_importance_groups_<model>.png   (Figure 6: lgbm_int)
+    figs\importance\feature_importance_groups_<model>.png
 
   Requires the trained models from step 3.
 
@@ -278,23 +277,24 @@ Training settings:
   Expected: 19/19 passed (13 pipeline tests + 6 weather tests, section 13.8).
 
 -------------------------------------------------------------------------------
-10. WHERE EACH FIGURE AND TABLE IN THE REPORT COMES FROM
+10. OUTPUTS AND THE STEP THAT PRODUCES THEM
 -------------------------------------------------------------------------------
 
-  Figure 1   figs\eda\eda_timeseries.png                           step 6
-  Figure 2   figs\eda\eda_heatmap.png                              step 6
-  Figure 3   figs\eda\eda_acf.png                                  step 6
-  Figure 4   figs\eda\eda_distribution.png                         step 6
-  Figure 5   figs\compare_by_horizon.png                           step 7
-  Figure 6   figs\importance\feature_importance_groups_lgbm_int.png step 9
+  Figures
+    figs\eda\eda_timeseries.png, eda_heatmap.png, eda_acf.png,
+        eda_distribution.png (also eda_by_hour.png, eda_by_month.png,
+        eda_outliers.png)                                            step 6
+    figs\compare_by_horizon.png                                      step 7
+    figs\importance\feature_importance_groups_lgbm_int.png          step 9
 
-  Table 1    data\entsoe_..._meta.json, features_price_only_meta.json
-  Table 2    data\eda_summary_by_year.csv                           step 6
-  Table 3    backtest console output / backtest_rolling_*.csv       step 5
-  Table 4    backtest_rolling_*_by_horizon.csv                      step 5
-  Table 5    models\<variant>\training_summary.csv (mean over 48 horizons) step 3
-  Table 6    stat_tests.py console output + stat_tests_*.csv        step 8
-  Table 7    computed from backtest_rolling_*.csv (section 12)       step 5
+  Tables
+    data\entsoe_..._meta.json, features_price_only_meta.json   data and feature description
+    data\eda_summary_by_year.csv                                annual statistics, step 6
+    backtest console output / backtest_rolling_*.csv           overall results, step 5
+    backtest_rolling_*_by_horizon.csv                          results by horizon, step 5
+    models\<variant>\training_summary.csv                      mean over 48 horizons, step 3
+    stat_tests.py console output + stat_tests_*.csv            statistical tests, step 8
+    computed from backtest_rolling_*.csv (section 12)          decision test, step 5
 
 -------------------------------------------------------------------------------
 11. REFERENCE VALUES FOR CHECKING A REPRODUCTION (Mode A)
@@ -334,12 +334,12 @@ Forecast origin in Mode A: 2026-09-22 23:00 (price 0.1474 EUR/kWh).
 12. NUMBERS COMPUTED FROM THE BACKTEST CSVs (not printed by a script)
 -------------------------------------------------------------------------------
 
-  - Decision test (Table 7): for each origin, the 4 hours in horizons 25-48
+  - Decision test: for each origin, the 4 hours in horizons 25-48
     with the lowest predicted price; mean realised (actual) price of those
     hours, x10.83. Oracle = 4 lowest actual; weekly = 4 lowest
     baseline_weekly_t168; "no information" = mean of all 24 hours.
-  - Spike analysis (10.1): hours with actual >= 95th percentile of actual.
-  - 15-minute effect (7.1): |price at hh:00 - mean of hh:00..hh:45|, Oct 2025
+  - Spike analysis: hours with actual >= 95th percentile of actual.
+  - 15-minute effect: |price at hh:00 - mean of hh:00..hh:45|, Oct 2025
     onwards, from the raw parquet.
 
 
@@ -348,8 +348,8 @@ Forecast origin in Mode A: 2026-09-22 23:00 (price 0.1474 EUR/kWh).
 -------------------------------------------------------------------------------
 
 Sections 1-12 describe the price-only models and are unchanged: without any of
-the weather options everything below is inactive and the reported numbers
-(section 11) are reproduced exactly as before. Weather is an optional add-on.
+the weather options everything below is inactive and the numbers
+in section 11 are reproduced exactly as before. Weather is an optional add-on.
 
 13.1 Idea and what the numbers mean
   A weather model gets, for target hour t+h, the temperature, wind speed and
@@ -362,7 +362,7 @@ the weather options everything below is inactive and the reported numbers
       That is what happened, not what was forecast, so the validation/backtest
       scores are an UPPER BOUND on the gain from weather. In a quick check
       (last 30 days, LightGBM) validation MAE improved 1-6 % at h = 1, 12, 24
-      and 48 with observed weather (this is not a report number).
+      and 48 with observed weather (not a full backtest result).
     * In live use forecast.py has only a MET forecast. The model was trained on
       perfect weather and is served imperfect weather (train/serve mismatch).
     * The only honest measurement is to predict with the forecast that existed
