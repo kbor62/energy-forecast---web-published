@@ -11,6 +11,7 @@ Usage:
   python run_pipeline.py
   python run_pipeline.py --weather
   python run_pipeline.py --model ridge_ohe --encoding both
+  python run_pipeline.py --skip-price-fetch --weather   # fetch only the weather
   python run_pipeline.py --skip-fetch --backtest --backtest-start "2026-01-01 00:00" --backtest-end "2026-08-31 00:00"
 """
 
@@ -105,14 +106,25 @@ def main():
     parser.add_argument(
         "--skip-fetch",
         action="store_true",
-        help="Skip price download (use existing data/entsoe_*.parquet)"
+        help="Skip all downloads: prices and, with --weather, weather history and forecast snapshot "
+             "(use the existing files)"
+    )
+    parser.add_argument(
+        "--skip-price-fetch",
+        action="store_true",
+        help="Skip only the price download (use existing data/entsoe_*.parquet); weather is still fetched"
+    )
+    parser.add_argument(
+        "--skip-weather-fetch",
+        action="store_true",
+        help="Skip only the weather downloads (history and forecast snapshot); prices are still fetched"
     )
     parser.add_argument(
         "--weather",
         action="store_true",
         help="Add weather: fetch Frost history + MET forecast snapshot, train with weather, "
              "forecast from the snapshot. Models go to models/<model>_<enc>_wx. "
-             "Needs FROST_CLIENT_ID in .env. --skip-fetch also skips the weather downloads."
+             "Needs FROST_CLIENT_ID in .env. --skip-fetch / --skip-weather-fetch skip the weather downloads."
     )
     parser.add_argument(
         "--weather-file",
@@ -170,8 +182,10 @@ def main():
 
     try:
         # Step 1: Fetch prices
-        if args.skip_fetch:
-            print("Step 1/4: Skipping price fetch (--skip-fetch)")
+        skip_prices = args.skip_fetch or args.skip_price_fetch
+        skip_weather = args.skip_fetch or args.skip_weather_fetch
+        if skip_prices:
+            print("Step 1/4: Skipping price fetch (--skip-fetch / --skip-price-fetch)")
             if not price_parquet.exists():
                 raise FileNotFoundError(f"Skip requested but file not found: {price_parquet}")
         else:
@@ -190,10 +204,10 @@ def main():
         # Step 1b: Weather (optional)
         weather_path = repo_root / args.weather_file
         if args.weather:
-            if args.skip_fetch:
-                print("Step 1b: Skipping weather downloads (--skip-fetch)")
+            if skip_weather:
+                print("Step 1b: Skipping weather downloads (--skip-fetch / --skip-weather-fetch)")
                 if not weather_path.exists():
-                    raise FileNotFoundError(f"--weather needs {weather_path}; run without --skip-fetch first")
+                    raise FileNotFoundError(f"--weather needs {weather_path}; run without --skip-fetch / --skip-weather-fetch first")
             else:
                 run_command(
                     [sys.executable, "src/fetch_weather.py", "--out", str(weather_path)],

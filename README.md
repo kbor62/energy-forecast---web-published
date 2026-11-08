@@ -69,6 +69,8 @@ convenience wrapper:
   python run_pipeline.py                              # Run with defaults
   python run_pipeline.py --model ridge_ohe --encoding both
   python run_pipeline.py --skip-fetch --model lgbm
+  python run_pipeline.py --skip-price-fetch --weather    # new weather, existing prices
+  python run_pipeline.py --skip-weather-fetch --weather  # new prices, existing weather
   python run_pipeline.py --backtest --backtest-start "2026-01-01 00:00" --backtest-end "2026-08-31 00:00"
   python run_pipeline.py --weather                    # add weather (section 13)
 
@@ -448,9 +450,10 @@ in section 11 are reproduced exactly as before. Weather is an optional add-on.
         before the prices
     3)  train.py ... --weather_file ... --out_dir models/<model>_<enc>_wx
     4)  forecast.py --model_dir models/<model>_<enc>_wx
-  --weather-file changes the observed weather file; --skip-fetch skips the price
-  and the weather downloads (the existing files and the latest archived snapshot
-  are used). With --backtest, --backtest-weather-mode observed|archive picks the
+  --weather-file changes the observed weather file. --skip-fetch skips all
+  downloads (the existing files and the latest archived snapshot are used);
+  --skip-price-fetch skips only the prices; --skip-weather-fetch skips only the
+  weather history and the forecast snapshot. With --backtest, --backtest-weather-mode observed|archive picks the
   prediction mode (13.4 e). Without --weather the pipeline is unchanged.
 
 13.7 How it is built (for review)
