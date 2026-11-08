@@ -27,6 +27,7 @@ Contents
  11. Reference values for checking a reproduction
  12. Numbers computed from the backtest CSVs
  13. Weather extension: observed weather, forecast snapshots, pipeline flag
+ 14. Weather backtest results (observed weather) and the per-block test
 
 -------------------------------------------------------------------------------
 0. WHAT "REPRODUCE" MEANS HERE (TWO MODES)
@@ -487,3 +488,76 @@ the weather options everything below is inactive and the reported numbers
     help" result of test_weather_hypothesis.py) is invalid. That script is
     deprecated and refuses to run without --force because it overwrites
     data\features_price_only.parquet.
+
+
+-------------------------------------------------------------------------------
+14. WEATHER BACKTEST RESULTS (OBSERVED WEATHER) - run 8 November 2026
+-------------------------------------------------------------------------------
+
+Same backtest settings as section 4 (origins 2026-01-01 00:00 .. 2026-08-29 01:00,
+step 48 h, 121 origins x 48 horizons = 5,808 forecasts, refit every 720 h, price
+file of 30 Oct 2026, seed 42). Weather = OBSERVED Oslo temperature, wind speed and
+precipitation at t+h (--weather_mode observed), so every gain below is an UPPER
+BOUND on what real forecasts would give (13.1). Run in a cloud container with the
+pinned versions (scikit-learn 1.9.1, lightgbm 4.7.0, pandas 3.0.6, numpy 2.5.3).
+The price-only lgbm_int run reproduced the section 11 values exactly (MAE 0.1747,
+RMSE 0.2617), so the setup matches. Origins fall at 00:00 local time in winter and
+01:00 in summer (48 absolute hours apart), i.e. a midnight origin, not the ~13:00
+day-ahead publication time.
+
+14.1 Commands
+  python src/train.py --inp data/features_price_only.parquet --model lgbm --encoding int --horizon 48 --val_days 30 --weather_file data/weather_oslo.parquet --out_dir models/lgbm_int_wx
+  python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model lgbm --encoding int --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48 --weather_file data/weather_oslo.parquet --weather_mode observed
+  (and the same with --encoding both; the price-only lgbm_both run is new and not
+  part of section 11)
+  python src/weather_block_test.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_int_wx.csv --out_csv data/weather_block_test_lgbm_int.csv
+
+14.2 Overall (NOK/kWh, 5,808 forecasts)
+  variant               MAE      RMSE     nMAE    mean validation MAE (EUR/kWh)
+  lgbm_int              0.1747   0.2617   15.8 %  0.0229
+  lgbm_int + weather    0.1696   0.2453   15.3 %  0.0225
+  lgbm_both             0.1842   0.2730   16.6 %  0.0247
+  lgbm_both + weather   0.1754   0.2567   15.8 %  0.0242
+  persistence           0.2253   0.3480   20.4 %
+  weekly t-168          0.2469   0.3539   22.3 %
+  lgbm_int is better than lgbm_both with and without weather (compared on totals;
+  no paired test between the variants). Best: lgbm_int + weather.
+
+14.3 Weather vs no weather, paired per origin (src\weather_block_test.py)
+  Per origin, the MAE inside each block of TARGET hours (Europe/Oslo clock) is
+  computed; the paired difference weather minus no weather is summarised with a
+  block-bootstrap 95 % CI (seed 42), the share of origins where weather is better and
+  a Wilcoxon p-value. Primary tests, fixed in advance: 06-20 (variable-price hours)
+  and 21-05 (flat hours), Holm over the two. The five blocks 00-05, 06-09, 10-15,
+  16-20, 21-23 are exploratory (Holm over the five).
+
+  lgbm_int        change   95 % CI of difference     better on   Holm p
+    all hours     -2.9 %   [-0.0107, +0.0006]        60 % origins 0.045*
+    06-20         -4.4 %   [-0.0175, -0.0010]        55 %         0.052
+    21-05         +1.6 %   [-0.0022, +0.0059]        49 %         0.71
+    10-15         -4.8 %   [-0.0194, -0.0029]        60 %         0.021
+    other blocks  -4.3..+2.6 %  CIs include 0                      0.19-0.84
+  lgbm_both
+    all hours     -4.8 %   [-0.0139, -0.0041]        69 %         <0.001
+    06-20         -5.7 %   [-0.0196, -0.0060]        66 %         <0.001
+    21-05         -2.1 %   [-0.0066, +0.0015]        54 %         0.13
+    06-09 / 10-15 / 16-20 / 21-23: -4.3 / -4.6 / -8.2 / -5.2 %, all Holm p < 0.03
+    00-05         -0.1 %   CI includes 0                           0.90
+  (* Wilcoxon p; the bootstrap CI of the overall lgbm_int difference includes 0.)
+  Pattern: the gain is concentrated in the hours with large price variation
+  (about 06-20) and is absent at night. For lgbm_int the overall gain is not
+  clearly separable from chance; for lgbm_both it is.
+
+14.4 Reading the results
+  * Observed weather overstates the benefit; real forecasts will give less. Only an
+    archive-mode backtest (13.5) measures that, and the archive is still empty.
+  * The two primary blocks and the overall figure are the planned tests; the five
+    smaller blocks are exploratory, and origins are not fully independent (prices
+    are autocorrelated from day to day).
+  * Daily averages hide the structure: night and late-evening hours have low error
+    because prices are flat there. Report per-block figures next to the total.
+  * A midnight origin differs from practical use (prices for the next day are
+    known from about 13:00). Testing an origin around 12:00 is not implemented.
+  * Files (git-ignored): models\lgbm_int_wx, models\lgbm_both_wx,
+    data\backtest_rolling_lgbm_{int,both}[_wx]*.csv and _meta.json,
+    data\weather_block_test_lgbm_{int,both}.csv, figs\backtest_rolling_*_wx.png.
