@@ -450,6 +450,29 @@ in section 11 are reproduced exactly as before. Weather is an optional add-on.
         before the prices
     3)  train.py ... --weather_file ... --out_dir models/<model>_<enc>_wx
     4)  forecast.py --model_dir models/<model>_<enc>_wx
+  Examples with lgbm_both and weather (model goes to models\lgbm_both_wx):
+
+    Everything fresh: prices, weather history, forecast snapshot, train, forecast
+      python run_pipeline.py --model lgbm --encoding both --weather
+
+    Only new weather (existing prices):
+      python run_pipeline.py --skip-price-fetch --model lgbm --encoding both --weather
+
+    Only new prices (existing weather and latest snapshot):
+      python run_pipeline.py --skip-weather-fetch --model lgbm --encoding both --weather
+
+    No downloads at all (existing files and latest snapshot):
+      python run_pipeline.py --skip-fetch --model lgbm --encoding both --weather
+
+    With rolling backtest (observed weather; use --backtest-weather-mode archive for
+    archived forecasts):
+      python run_pipeline.py --skip-fetch --model lgbm --encoding both --weather --backtest --backtest-start "2026-01-01 00:00" --backtest-end "2026-08-31 00:00"
+
+    Quick forecast refresh without retraining (new snapshot, then forecast):
+      python src/fetch_weather_forecast.py
+      python src/forecast.py --model_dir models/lgbm_both_wx --horizon 48 --save_png
+
+  Every run of the pipeline retrains; prices are always fetched from 2020-01-01.
   --weather-file changes the observed weather file. --skip-fetch skips all
   downloads (the existing files and the latest archived snapshot are used);
   --skip-price-fetch skips only the prices; --skip-weather-fetch skips only the
