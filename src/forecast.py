@@ -10,6 +10,11 @@ was trained with). The run prints how many values came from each source and
 stores the details under "weather" in the JSON output. Price-only models ignore
 all of this.
 
+Models trained with --exog_file also need ENTSO-E exog data (day-ahead wind/solar
+forecasts of neighbouring zones, neighbour prices; see exog.py): the file in the
+manifest, or --exog_file. Refresh it with fetch_entsoe_exog.py first. Forecast hours
+whose wind/solar forecast is not published at the decision time are passed as NaN.
+
     python src/forecast.py --price data/entsoe_NO_1_2020-01-01_now.parquet --model_dir models/lgbm_int --horizon 48 --save_png
 """
 
@@ -27,6 +32,7 @@ import pandas as pd
 from joblib import load
 
 import features as F
+import exog as X_
 import models as M
 from config import EUR_TO_NOK, ROOT, TZ, repo_path
 from plotting import save_figure
@@ -69,6 +75,7 @@ def main() -> None:
         default=None,
         help="Use the latest snapshot issued at/before this time (default: now, or --origin if given)",
     )
+    ap.add_argument("--exog_file", default=None, help="ENTSO-E exog parquet (default: the file the model was trained with)")
     ap.add_argument("--save_png", action="store_true")
     ap.add_argument("--history_hours", type=int, default=72, help="History shown in the plot")
     args = ap.parse_args()
@@ -94,6 +101,19 @@ def main() -> None:
         origin = observed.index[-1]
 
     history = F.history_features(price)
+
+    # Models trained with ENTSO-E exog features (wind/solar forecasts, neighbour prices) need the
+    # same file, refreshed with fetch_entsoe_exog.py. Wind/solar hours not yet published are NaN.
+    exog_cols = manifest.get("exog_cols") or []
+    exog = None
+    if exog_cols:
+        exog_path = args.exog_file or manifest.get("exog_file")
+        exog = X_.load_exog(exog_path, exog_cols)
+        n_exog = len(X_.feature_names(exog_cols))
+        last = exog.dropna(how="all").index.max()
+        print(f"Exog: {exog_path}   {len(exog_cols)} columns -> {n_exog} features   data until {last}")
+        if last < origin + pd.Timedelta(hours=1):
+            print("  WARNING: exog data ends at/before the origin; run fetch_entsoe_exog.py")
 
     # Weather-trained models need weather at origin+h: archived forecast where it
     # covers the hour, observations otherwise. Models without weather skip this.
@@ -127,7 +147,7 @@ def main() -> None:
     rows = []
     for h in sorted(models):
         payload = models[h]["payload"]
-        X = F.assemble(history, [origin], h, encoding, weather=weather)
+        X = F.assemble(history, [origin], h, encoding, weather=weather, exog=exog)
         if list(X.columns) != list(payload["features"]):
             raise RuntimeError(
                 f"t+{h}h: model expects {len(payload['features'])} features, built {X.shape[1]}. "

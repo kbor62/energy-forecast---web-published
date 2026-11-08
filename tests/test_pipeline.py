@@ -338,6 +338,150 @@ def test_snapshot_archive_skips_an_already_stored_run():
         assert "issued_at" in saved.columns and "oslo_temperature_C" in saved.columns
 
 
+# --------------------------------------------------------------------------- #
+# Backtest origin clock time
+# --------------------------------------------------------------------------- #
+def test_default_origins_drift_with_dst_but_origin_hour_does_not():
+    """Absolute 48 h steps change local clock time at DST; --origin_hour keeps it fixed."""
+    import backtest_rolling as B
+
+    drifting = B.build_origins("2026-01-01 00:00", "2026-08-31 00:00", 48)
+    assert set(drifting.hour) == {0, 1}
+
+    fixed = B.build_origins("2026-01-01 00:00", "2026-08-31 00:00", 48, origin_hour=23)
+    assert set(fixed.hour) == {23}
+    assert fixed[0] == pd.Timestamp("2026-01-01 23:00", tz=TZ)
+    assert (fixed[1:] - fixed[:-1] != pd.Timedelta(hours=48)).any(), "spacing is 2 calendar days, not 48 h"
+    days = pd.DatetimeIndex(fixed.tz_localize(None)).normalize()
+    assert ((days[1:] - days[:-1]) == pd.Timedelta(days=2)).all()
+
+
+def test_origin_hour_validation_and_dst_gaps():
+    """step must be whole days; a nonexistent local hour (DST) is dropped, not an error."""
+    import backtest_rolling as B
+
+    for bad in ({"step": 36, "origin_hour": 12}, {"step": 48, "origin_hour": 24}):
+        try:
+            B.build_origins("2026-01-01 00:00", "2026-02-01 00:00", **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad}")
+
+    # 02:00 does not exist on 2026-03-29 (spring forward); step 1 day hits that date
+    o = B.build_origins("2026-03-27 00:00", "2026-03-31 00:00", 24, origin_hour=2)
+    assert pd.Timestamp("2026-03-29 02:00", tz="UTC").tz_convert(TZ) not in o
+    assert len(o) == 3  # 27, 28 and 30 March; the 29th is dropped, 31st 02:00 is after the end
+
+
+# --------------------------------------------------------------------------- #
+# ENTSO-E exogenous features (wind/solar forecasts, neighbour prices)
+# --------------------------------------------------------------------------- #
+def _exog_frame(n_hours: int = 24 * 12) -> pd.DataFrame:
+    idx = pd.date_range("2026-03-01", periods=n_hours, freq="h", tz=TZ)
+    pos = np.arange(n_hours, dtype=float)
+    return pd.DataFrame({"wind_DE_LU_MW": pos, "solar_DE_LU_MW": 2 * pos, "price_SE_3_EUR_MWh": 3 * pos}, index=idx)
+
+
+def test_wind_solar_frames_are_normalised_to_hourly_zone_columns():
+    """Onshore + offshore are summed, solar kept; flat and MultiIndex columns both work."""
+    import exog as X
+
+    idx = pd.date_range("2026-01-01", periods=8, freq="15min", tz="Europe/Berlin")
+    flat = pd.DataFrame({"Solar": 10.0, "Wind Offshore": 100.0, "Wind Onshore": 50.0}, index=idx)
+    multi = flat.copy()
+    multi.columns = pd.MultiIndex.from_tuples([(c, "Actual Aggregated") for c in flat.columns])
+
+    for frame in (flat, multi):
+        out = X.normalise_wind_solar(frame, "DE_LU")
+        assert list(out.columns) == ["wind_DE_LU_MW", "solar_DE_LU_MW"]
+        assert len(out) == 2 and (out["wind_DE_LU_MW"] == 150.0).all() and (out["solar_DE_LU_MW"] == 10.0).all()
+        assert str(out.index.tz) == TZ
+
+
+def test_exog_availability_follows_the_day_ahead_schedule():
+    """Origin 23:00 on D: tomorrow (h 1-24) is published, the day after (h 25-48) is not."""
+    import exog as X
+
+    o = pd.DatetimeIndex([pd.Timestamp("2026-03-10 23:00", tz=TZ)])
+    assert all(X.available_mask(o, h).iloc[0] for h in range(1, 25))
+    assert not any(X.available_mask(o, h).iloc[0] for h in range(25, 49))
+
+    # Origin 00:00 on D: decision ~13:00 on D-1, so only hours of D itself are published.
+    o0 = pd.DatetimeIndex([pd.Timestamp("2026-03-10 00:00", tz=TZ)])
+    assert X.available_mask(o0, 23).iloc[0] and not X.available_mask(o0, 24).iloc[0]
+
+
+def test_exog_features_have_no_look_ahead():
+    """Unpublished target hours are NaN; neighbour prices come from the origin and 24 h before only."""
+    import exog as X
+
+    ex = _exog_frame()
+    origin = pd.DatetimeIndex([pd.Timestamp("2026-03-05 23:00", tz=TZ)])
+    f24 = X.exog_features(ex, origin, 24)
+    f30 = X.exog_features(ex, origin, 30)
+
+    assert f24["wind_DE_LU_MW_target"].iloc[0] == ex["wind_DE_LU_MW"].loc[origin[0] + pd.Timedelta(hours=24)]
+    assert np.isnan(f30["wind_DE_LU_MW_target"].iloc[0]) and np.isnan(f30["solar_DE_LU_MW_target"].iloc[0])
+    assert f30["price_SE_3_EUR_MWh_origin"].iloc[0] == ex["price_SE_3_EUR_MWh"].loc[origin[0]]
+    assert f30["price_SE_3_EUR_MWh_origin_lag24h"].iloc[0] == ex["price_SE_3_EUR_MWh"].loc[origin[0] - pd.Timedelta(hours=24)]
+
+    tampered = ex.copy()  # change prices after the origin and wind in the unpublished hours
+    tampered.loc[tampered.index > origin[0], "price_SE_3_EUR_MWh"] = -999.0
+    tampered.loc[tampered.index > origin[0] + pd.Timedelta(hours=24), "wind_DE_LU_MW"] = -999.0
+    pd.testing.assert_frame_equal(X.exog_features(tampered, origin, 30), f30)
+
+
+def test_assemble_appends_exog_features_after_price_and_weather():
+    """Column order: price/calendar, weather, exog; feature_names matches what is built."""
+    import exog as X
+
+    price = synthetic_price()
+    history = F.history_features(price)
+    ex = _exog_frame()
+    ex.index = price.index[: len(ex)]
+    weather = _weather_frame(price.index)
+    origins = price.index[100:103]
+
+    X0 = F.assemble(history, origins, 6, "int")
+    X1 = F.assemble(history, origins, 6, "int", weather=weather, exog=ex)
+    assert list(X1.columns) == (list(X0.columns) + ["temperature_C_target", "wind_speed_ms_target"]
+                                + X.feature_names(ex.columns))
+    assert list(F.assemble(history, origins, 6, "int", exog=ex).columns)[len(X0.columns):] == X.feature_names(ex.columns)
+
+
+def test_exog_fetch_skips_failing_zones_and_fails_when_nothing_arrives():
+    """Offline check of fetch_entsoe_exog with a fake client."""
+    import fetch_entsoe_exog as FX
+
+    idx = pd.date_range("2026-01-01", periods=8, freq="15min", tz="Europe/Brussels")
+
+    class Fake:
+        def query_wind_and_solar_forecast(self, zone, start, end):
+            if zone == "BAD":
+                raise ValueError("no data")
+            return pd.DataFrame({"Solar": 1.0, "Wind Onshore": 2.0}, index=idx)
+
+        def query_day_ahead_prices(self, zone, start, end):
+            return pd.Series(50.0, index=idx)
+
+    chunks = [(pd.Timestamp("2026-01-01", tz="Europe/Brussels"), pd.Timestamp("2026-01-02", tz="Europe/Brussels"))]
+    df = FX.fetch_all(Fake(), ["DE_LU", "BAD"], ["NO_2"], chunks, retries=1, sleep=0)
+    assert sorted(df.columns) == ["price_NO_2_EUR_MWh", "solar_DE_LU_MW", "wind_DE_LU_MW"]
+
+    class Empty(Fake):
+        def query_wind_and_solar_forecast(self, zone, start, end):
+            raise ValueError("no data")
+
+        def query_day_ahead_prices(self, zone, start, end):
+            raise ValueError("no data")
+
+    try:
+        FX.fetch_all(Empty(), ["DE_LU"], ["NO_2"], chunks, retries=1, sleep=0)
+    except RuntimeError:
+        return
+    raise AssertionError("expected RuntimeError when no zone returns data")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

@@ -28,6 +28,8 @@ Contents
  12. Numbers computed from the backtest CSVs
  13. Weather extension: observed weather, forecast snapshots, pipeline flag
  14. Weather backtest results (observed weather) and the per-block test
+ 15. Backtest origin clock time (--origin_hour)
+ 16. ENTSO-E exogenous features: wind/solar forecasts and neighbour prices
 
 -------------------------------------------------------------------------------
 0. WHAT "REPRODUCE" MEANS HERE (TWO MODES)
@@ -276,7 +278,7 @@ Training settings:
 
   python tests/test_pipeline.py        (or: pytest tests/)
 
-  Expected: 19/19 passed (13 pipeline tests + 6 weather tests, section 13.8).
+  Expected: 26/26 passed (13 pipeline tests, 6 weather, 2 origin-time and 5 ENTSO-E exog tests; sections 13.8, 15 and 16.7).
 
 -------------------------------------------------------------------------------
 10. OUTPUTS AND THE STEP THAT PRODUCES THEM
@@ -490,8 +492,9 @@ in section 11 are reproduced exactly as before. Weather is an optional add-on.
   forecast.py refuses to run if the built feature list differs from the
     model's saved "features" (model/manifest mismatch).
 
-13.8 Tests  (python tests/test_pipeline.py  or  pytest tests/ ; expected 19/19)
-  The 13 tests of section 9 plus six weather tests: target-hour alignment of the
+13.8 Tests  (python tests/test_pipeline.py  or  pytest tests/ ; expected 26/26)
+  The 13 tests of section 9, two origin-time tests (section 15), five ENTSO-E exog
+  tests (section 16.7) and six weather tests: target-hour alignment of the
   weather columns, price-only features unchanged without weather, ridge keeps the
   weather columns, snapshot choice never looks ahead, snapshot-only mode has no
   fallback to observations, archiving is idempotent.
@@ -587,3 +590,126 @@ day-ahead publication time.
   * Files (git-ignored): models\lgbm_int_wx, models\lgbm_both_wx,
     data\backtest_rolling_lgbm_{int,both}[_wx]*.csv and _meta.json,
     data\weather_block_test_lgbm_{int,both}.csv, figs\backtest_rolling_*_wx.png.
+
+
+-------------------------------------------------------------------------------
+15. BACKTEST ORIGIN CLOCK TIME (--origin_hour)
+-------------------------------------------------------------------------------
+
+Origin = the last hour whose price is known when the forecast is made. History
+features are computed up to the origin; horizons 1..48 are the hours after it.
+
+15.1 Default (unchanged)
+  Origins are --step absolute hours apart from --start. Local clock time then
+  drifts by an hour at each DST change (00:00 in winter, 01:00 in summer in the
+  2026 backtest). A midnight origin is not how the forecast is used in practice.
+
+15.2 Practical case: --origin_hour 23
+  Day-ahead prices for day D are published on D-1; prices for D+1 are published
+  around 13:00 on D. A forecast made at about 12:00 on D therefore knows prices up
+  to D 23:00, so the origin is D 23:00 and horizons 1-24 are tomorrow's auction
+  prices, 25-48 the day after. Weather forecasts must not be newer than the
+  decision time; in archive mode use --snapshot_lag_hours 11 (origin 23:00 minus
+  12:00) so snapshots issued after about 12:00 are not used.
+
+    python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model lgbm --encoding int --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48 --origin_hour 23
+    ... --weather_file data/weather_oslo.parquet --weather_mode archive --origin_hour 23 --snapshot_lag_hours 11
+
+  --origin_hour (0-23) fixes the local clock hour of every origin, independent of
+  DST; --step must be a multiple of 24 (48 = every second day). A local hour that
+  does not exist or is ambiguous on a DST day (02:00-03:00) is skipped. Outputs get
+  the suffix _o<hour> (e.g. backtest_rolling_lgbm_int_o23.csv), so they do not
+  overwrite the default runs; --compare works across them only on common origins,
+  so compare runs with the same --origin_hour.
+
+15.3 Pipeline
+  python run_pipeline.py --skip-fetch --model lgbm --encoding int --weather --backtest --backtest-start "2026-01-01 00:00" --backtest-end "2026-08-31 00:00" --backtest-origin-hour 23
+  --backtest-snapshot-lag N is passed on as --snapshot_lag_hours (archive mode).
+
+15.4 Caveats
+  * Only the scoring changes: the backtest still trains on every hour as a
+    forecast origin and scores the chosen origins. train.py's validation window
+    (last 30 days) uses every hour as origin and is unaffected.
+  * Prices known at the origin are assumed to be known to the last hour of D; this
+    matches the day-ahead schedule for NO1 but the publication time (about 13:00)
+    is not modelled to the minute.
+
+
+-------------------------------------------------------------------------------
+16. ENTSO-E EXOGENOUS FEATURES: WIND/SOLAR FORECASTS AND NEIGHBOUR PRICES
+-------------------------------------------------------------------------------
+
+Optional add-on (added November 2026). Without --exog_file nothing changes. It
+complements the Oslo weather of section 13: Oslo weather describes NO1 demand,
+while neighbouring zones' wind and solar generation (Germany, Denmark, Sweden)
+sets the supply side that NO1 trades with through the interconnectors.
+
+STATUS: implemented and unit-tested, but NOT yet run on real ENTSO-E data (the
+development environment cannot reach the ENTSO-E API). No results exist yet; run
+the fetch (16.3) and the backtests (16.4) yourself.
+
+16.1 Features (module src\exog.py)
+  One hourly parquet, columns by name prefix:
+    wind_<ZONE>_MW, solar_<ZONE>_MW  day-ahead forecast (A69) for the TARGET hour
+                                     -> <col>_target
+    price_<ZONE>_EUR_MWh             neighbour day-ahead price (A44), used only
+                                     up to the ORIGIN -> <col>_origin and
+                                     <col>_origin_lag24h
+  Default zones: wind/solar DE_LU, DK_1, DK_2, SE_3; prices NO_2, SE_3, DK_1, DE_LU.
+  A neighbour price at the target hour is NOT a feature: it is set in the same
+  auction as the NO1 price and is unknown at forecast time.
+
+16.2 Availability rule (no look-ahead)
+  Day-ahead wind/solar forecasts for day D+1 are published around 12:00 on D. For
+  an origin t the decision time is t - 11 h (origin 23:00 -> 12:00 the same day). A
+  target-hour value is available only if its local date is at most one day after
+  the decision date; later hours are NaN - in training, backtesting and forecasting
+  alike. With origin 23:00 horizons 1-24 (tomorrow) have wind/solar values and
+  25-48 do not. LightGBM handles NaN; ridge imputes the median. The publication
+  time (about 12:00) is an ASSUMPTION; ENTSO-E does not give the publication time
+  per value, and some TSOs publish later. If so, results are slightly optimistic.
+
+16.3 Fetch
+  python src/fetch_entsoe_exog.py
+  python src/fetch_entsoe_exog.py --wind_zones DE_LU DK_1 --price_zones NO_2 SE_3 --start 2023-01-01
+  Needs ENTSOE_TOKEN in .env. Output: data\entsoe_exog.parquet (+ _meta.json with
+  rows and first/last time per column). Fetches until now + 2 days, so tomorrow's
+  forecasts are included once published. A zone that fails is skipped with a
+  warning; the run fails only if nothing arrives. Re-run to refresh before
+  forecasting. Zone codes are entsoe-py areas (DE_LU, DK_1, DK_2, SE_3, SE_4, NO_2, ...).
+
+16.4 Train, forecast, backtest
+  python src/train.py --inp data/features_price_only.parquet --model lgbm --encoding both --horizon 48 --val_days 30 --exog_file data/entsoe_exog.parquet --out_dir models/lgbm_both_ex
+  python src/forecast.py --model_dir models/lgbm_both_ex --horizon 48 --save_png
+  python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model lgbm --encoding both --exog_file data/entsoe_exog.parquet --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48 --origin_hour 23
+  --exog_cols picks columns (default: all in the file). Weather and exog combine:
+  pass both --weather_file and --exog_file (model directory suffix _wx_ex; backtest
+  output suffixes _wx, _ex, _o23, in that order). forecast.py reads the file path
+  and columns from the model manifest; --exog_file overrides the path.
+  Compare variants on the same origins (same --origin_hour), see section 15.
+  Suggested comparison, all with --origin_hour 23: price only; + Oslo weather;
+  + ENTSO-E; both. Use src\weather_block_test.py for paired tests (it takes any two
+  backtest CSVs, base and extended).
+
+16.5 Pipeline
+  python run_pipeline.py --model lgbm --encoding both --weather --exog
+  --exog fetches the ENTSO-E file first (needs ENTSOE_TOKEN), trains with it and
+  forecasts with it; --skip-fetch or --skip-exog-fetch use the existing file.
+  Models go to models\<model>_<enc>[_wx]_ex. With --backtest the exog file is
+  passed on (and --backtest-origin-hour works as before).
+
+16.6 Limits
+  * Forecast hours after the last published day are NaN. For a clean live
+    forecast run it before about 13:00 with prices known through the end of the
+    same day (origin 23:00); after 13:00 the origin moves a day on and the
+    required forecasts are not yet published.
+  * Neighbour-price features are lags of the origin only (origin and 24 h before).
+  * Wind/solar forecasts are as stored by ENTSO-E (not an archive of vintages);
+    revised values may differ slightly from what was known at the time.
+  * Load forecasts, net transfer capacities and flows are not included.
+
+16.7 Tests (tests\test_pipeline.py)
+  Normalisation of entsoe-py wind/solar frames (flat and MultiIndex), the
+  availability rule, no look-ahead (perturbing unpublished values or later prices
+  leaves the features unchanged), column order of assemble(), and the fetch logic
+  with a fake client (failing zones skipped, error when nothing arrives).

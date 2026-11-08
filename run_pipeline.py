@@ -3,6 +3,8 @@
 Convenience wrapper for the energy forecast pipeline.
 
 Runs the complete pipeline: fetch prices → build features → train → forecast → (optional) backtest.
+With --exog it also fetches ENTSO-E wind/solar forecasts and neighbour prices and uses them
+as features (combines with --weather).
 With --weather it also fetches weather history (Frost) and archives a MET forecast snapshot,
 trains with weather at the target hour, and forecasts from the latest snapshot.
 Each step can also be run manually; see README.md for details.
@@ -127,6 +129,23 @@ def main():
              "Needs FROST_CLIENT_ID in .env. --skip-fetch / --skip-weather-fetch skip the weather downloads."
     )
     parser.add_argument(
+        "--exog",
+        action="store_true",
+        help="Add ENTSO-E exog features: day-ahead wind/solar forecasts of neighbouring zones and neighbour prices "
+             "(fetch_entsoe_exog.py, needs ENTSOE_TOKEN). Combines with --weather. Models go to "
+             "models/<model>_<enc>[_wx]_ex. --skip-fetch / --skip-exog-fetch skip the download."
+    )
+    parser.add_argument(
+        "--skip-exog-fetch",
+        action="store_true",
+        help="Skip only the ENTSO-E exog download (use the existing --exog-file)"
+    )
+    parser.add_argument(
+        "--exog-file",
+        default="data/entsoe_exog.parquet",
+        help="ENTSO-E exog parquet (default: data/entsoe_exog.parquet)"
+    )
+    parser.add_argument(
         "--weather-file",
         default="data/weather_oslo.parquet",
         help="Observed weather parquet used for training (default: data/weather_oslo.parquet)"
@@ -141,6 +160,20 @@ def main():
         choices=["observed", "archive"],
         default="observed",
         help="With --weather: predict with observed weather (upper bound) or archived MET snapshots (realistic)"
+    )
+    parser.add_argument(
+        "--backtest-origin-hour",
+        type=int,
+        default=None,
+        help="Local clock hour of each backtest origin (= last known price hour). 23 = forecast made ~12:00 "
+             "the same day, before tomorrow's prices are published. Default: 48 absolute hours apart"
+    )
+    parser.add_argument(
+        "--backtest-snapshot-lag",
+        type=int,
+        default=0,
+        help="With --backtest-weather-mode archive: snapshots must be issued this many hours before the origin "
+             "(11 for --backtest-origin-hour 23)"
     )
     parser.add_argument(
         "--backtest-start",
@@ -176,6 +209,7 @@ def main():
     print(f"Horizon: {args.horizon}h")
     print(f"Validation: {args.val_days} days")
     print(f"Weather: {'ON (' + args.weather_file + ')' if args.weather else 'off'}")
+    print(f"ENTSO-E exog: {'ON (' + args.exog_file + ')' if args.exog else 'off'}")
     if args.backtest:
         print(f"Backtest: {args.backtest_start} to {args.backtest_end}")
     print()
@@ -219,6 +253,19 @@ def main():
                     print("WARNING: forecast snapshot failed; forecast will use the latest earlier snapshot, if any")
             check_weather_freshness(price_parquet, weather_path)
 
+        # Step 1c: ENTSO-E exog (optional)
+        exog_path = repo_root / args.exog_file
+        if args.exog:
+            if args.skip_fetch or args.skip_exog_fetch:
+                print("Step 1c: Skipping ENTSO-E exog download (--skip-fetch / --skip-exog-fetch)")
+                if not exog_path.exists():
+                    raise FileNotFoundError(f"--exog needs {exog_path}; run without --skip-fetch / --skip-exog-fetch first")
+            else:
+                run_command(
+                    [sys.executable, "src/fetch_entsoe_exog.py", "--out", str(exog_path)],
+                    "1c: Fetch ENTSO-E wind/solar forecasts and neighbour prices"
+                )
+
         # Step 2: Build features
         run_command(
             [
@@ -242,12 +289,16 @@ def main():
             train_cmd.extend(["--encoding", args.encoding])
 
         model_dir = None
+        if args.weather or args.exog:
+            # Keep models with extra features apart from the price-only models.
+            enc = args.encoding or default_encoding_for(args.model)
+            suffix = ("_wx" if args.weather else "") + ("_ex" if args.exog else "")
+            model_dir = repo_root / f"models/{args.model}_{enc}{suffix}"
+            train_cmd.extend(["--out_dir", str(model_dir)])
         if args.weather:
             train_cmd.extend(["--weather_file", args.weather_file])
-            # Keep weather models apart from the price-only models.
-            enc = args.encoding or default_encoding_for(args.model)
-            model_dir = repo_root / f"models/{args.model}_{enc}_wx"
-            train_cmd.extend(["--out_dir", str(model_dir)])
+        if args.exog:
+            train_cmd.extend(["--exog_file", args.exog_file])
 
         run_command(train_cmd, f"3/4: Train ({args.model}{'_' + args.encoding if args.encoding else ''})")
 
@@ -298,12 +349,19 @@ def main():
             if args.encoding:
                 backtest_cmd.extend(["--encoding", args.encoding])
 
-            backtest_name = model_dir.name
+            if args.backtest_origin_hour is not None:
+                backtest_cmd.extend(["--origin_hour", str(args.backtest_origin_hour),
+                                     "--snapshot_lag_hours", str(args.backtest_snapshot_lag)])
+            backtest_name = model_dir.name.removesuffix("_ex").removesuffix("_wx")
             if args.weather:
                 backtest_cmd.extend(["--weather_file", args.weather_file,
                                      "--weather_mode", args.backtest_weather_mode])
-                backtest_name = model_dir.name.removesuffix("_wx") + (
-                    "_wx" if args.backtest_weather_mode == "observed" else "_wxfc")
+                backtest_name += "_wx" if args.backtest_weather_mode == "observed" else "_wxfc"
+            if args.exog:
+                backtest_cmd.extend(["--exog_file", args.exog_file])
+                backtest_name += "_ex"
+            if args.backtest_origin_hour is not None:
+                backtest_name += f"_o{args.backtest_origin_hour}"
 
             run_command(backtest_cmd, "5: Backtest (rolling-origin)")
 
@@ -316,6 +374,8 @@ def main():
         print(f"  Model:      {model_dir}/")
         if args.weather:
             print(f"  Weather:    {weather_path} (+ snapshots in data/forecast_archive/)")
+        if args.exog:
+            print(f"  ENTSO-E:    {exog_path}")
         print(f"  Forecast:   data/forecast_{model_dir.name}.csv")
         print(f"  Figures:    figs/")
         if args.backtest:

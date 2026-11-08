@@ -141,6 +141,7 @@ def assemble(
     horizon: int,
     encoding: str = "trig",
     weather: pd.DataFrame | None = None,
+    exog: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Design matrix: history at each origin, calendar at origin + horizon.
 
@@ -148,6 +149,11 @@ def assemble(
     ``<col>_target``: the weather at the target hour origin + horizon. In
     training this is observed weather (an upper bound); at inference it must be
     replaced by archived/real forecast values.
+
+    If ``exog`` (ENTSO-E wind/solar forecasts and neighbour prices, see exog.py) is
+    given, its features are appended after the weather columns: ``<col>_target`` for
+    target-hour forecasts (NaN where not yet published at the decision time) and
+    ``<col>_origin`` / ``<col>_origin_lag24h`` for neighbour prices.
     """
     origins = pd.DatetimeIndex(origins)
     targets = origins + pd.Timedelta(hours=horizon)
@@ -159,10 +165,16 @@ def assemble(
         w = weather.reindex(targets)
         w.index = origins
         parts.append(w.add_suffix("_target"))
-    X = pd.concat(parts, axis=1)
     cols = feature_columns(encoding)
     if weather is not None:
         cols = cols + [f"{c}_target" for c in weather.columns]
+    if exog is not None:
+        import exog as _exog
+
+        block = _exog.exog_features(exog, origins, horizon)
+        parts.append(block)
+        cols = cols + list(block.columns)
+    X = pd.concat(parts, axis=1)
     return X.loc[:, cols]
 
 

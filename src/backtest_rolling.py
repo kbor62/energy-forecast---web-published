@@ -6,10 +6,22 @@ known at the last refit time. Models are refit every --refit_every hours.
 Weather (optional, --weather_file): adds the weather at t+h as features. Training
 always uses observed weather. --weather_mode controls prediction:
   observed  observed weather (oracle / upper bound; default)
-  archive   latest archived MET snapshot issued at or before each origin, with no
-            fallback to observations. Origins without a snapshot are skipped.
+  archive   latest archived MET snapshot issued at or before each origin (minus
+            --snapshot_lag_hours), with no fallback to observations. Origins
+            without a snapshot are skipped.
 Outputs get the suffix _wx (observed) or _wxfc (archive); compare them with the
 price-only run using --compare.
+
+ENTSO-E exog (--exog_file): neighbouring zones' day-ahead wind/solar forecasts at the
+target hour and neighbour prices at the origin (exog.py); outputs get the suffix _ex.
+Wind/solar values not yet published at the decision time (origin minus 11 h) are NaN.
+
+Origin time: by default origins are --step absolute hours apart from --start. With
+--origin_hour H every origin is at local clock hour H (DST-proof; outputs get _o<H>).
+The origin is the last KNOWN price hour. Use --origin_hour 23 for the practical case:
+forecast made about 12:00 on day D, when D's prices are known and D+1's are not yet
+published, so horizons 1-24 are tomorrow's auction prices. Add --snapshot_lag_hours 11
+so archived weather forecasts cannot be newer than that decision time.
 
     python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model lgbm --encoding int --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48
     python src/backtest_rolling.py --model ridge_ohe --encoding both --start "2026-01-01 00:00" --end "2026-08-31 00:00"
@@ -32,6 +44,7 @@ import numpy as np
 import pandas as pd
 
 import features as F
+import exog as X_
 import models as M
 from config import EUR_TO_NOK, ROOT, TZ, repo_path
 from metrics import block_bootstrap_ci, skill, summarize
@@ -57,6 +70,29 @@ def to_tz(ts) -> pd.Timestamp:
     return ts.floor("h")
 
 
+def build_origins(start, end, step: int, origin_hour: int | None = None) -> pd.DatetimeIndex:
+    """Forecast origins between start and end.
+
+    Default: every ``step`` absolute hours from start (the local clock time then
+    drifts by one hour at each DST change). With ``origin_hour``: one origin per
+    ``step // 24`` days at that local clock hour, DST-proof (``step`` must be a
+    multiple of 24). The origin is the last known price hour: origin_hour=23 means
+    the forecast is made around 12:00 the same day, when that day's prices are
+    known and tomorrow's are not yet published.
+    """
+    start, end = to_tz(start), to_tz(end)
+    if origin_hour is None:
+        return pd.date_range(start, end, freq=f"{step}h", tz=TZ)
+    if step % 24:
+        raise ValueError("--origin_hour requires --step to be a multiple of 24")
+    if not 0 <= origin_hour <= 23:
+        raise ValueError("--origin_hour must be 0-23")
+    days = pd.date_range(start.tz_localize(None).normalize(), end.tz_localize(None), freq=f"{step // 24}D")
+    local = pd.DatetimeIndex(days) + pd.Timedelta(hours=origin_hour)
+    origins = local.tz_localize(TZ, ambiguous="NaT", nonexistent="NaT").dropna()
+    return origins[(origins >= start) & (origins <= end)]
+
+
 def run_backtest(args) -> tuple[pd.DataFrame, dict]:
     price = load_price_series(repo_path(args.inp), tz=TZ)
     history = F.history_features(price)
@@ -77,7 +113,17 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
         extra_cols = [f"{c}_target" for c in args.weather_cols]
         print(f"Weather: {args.weather_cols} from {args.weather_file}   prediction mode: {args.weather_mode}")
 
-    origins = pd.date_range(to_tz(args.start), to_tz(args.end), freq=f"{args.step}h", tz=TZ)
+    # ENTSO-E exog (wind/solar forecasts at the target hour, neighbour prices at the origin).
+    # Values are as published, so no oracle problem; hours not yet published at the decision
+    # time (origin - 11 h) are NaN, see exog.py. Used in training and prediction alike.
+    exog = None
+    if args.exog_file:
+        exog = X_.load_exog(args.exog_file, args.exog_cols)
+        extra_cols = extra_cols + X_.feature_names(exog.columns)
+        print(f"Exog: {list(exog.columns)} from {args.exog_file}")
+
+    origins = build_origins(args.start, args.end, args.step, args.origin_hour)
+    snapshot_lag = pd.Timedelta(hours=args.snapshot_lag_hours)
     usable = [
         o
         for o in origins
@@ -87,7 +133,7 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
     ]
     n_skipped_no_snapshot = 0
     if weather_obs is not None and args.weather_mode == "archive":
-        with_snap = [o for o in usable if pick_snapshot(o, args.weather_archive) is not None]
+        with_snap = [o for o in usable if pick_snapshot(o - snapshot_lag, args.weather_archive) is not None]
         n_skipped_no_snapshot = len(usable) - len(with_snap)
         if n_skipped_no_snapshot:
             print(f"Skipping {n_skipped_no_snapshot} origins with no forecast snapshot issued at/before them")
@@ -118,7 +164,7 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
             weather_at_origin, _ = weather_for_forecast(
                 args.weather_cols,
                 origin + pd.to_timedelta(horizons, unit="h"),
-                origin,
+                origin - snapshot_lag,
                 args.weather_archive,
                 observed_path=None,
             )
@@ -139,7 +185,7 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
                     )
 
                 X = M.prepare_X(
-                    args.model, F.assemble(history, train_index, h, encoding, weather=weather_obs), encoding
+                    args.model, F.assemble(history, train_index, h, encoding, weather=weather_obs, exog=exog), encoding
                 )
                 y = targets.loc[train_index, F.target_column(h)].to_numpy(dtype=float)
 
@@ -152,7 +198,7 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
                     fit_notes.append({"anchor": str(anchor), **info})
 
             x_row = M.prepare_X(
-                args.model, F.assemble(history, [origin], h, encoding, weather=weather_at_origin), encoding
+                args.model, F.assemble(history, [origin], h, encoding, weather=weather_at_origin, exog=exog), encoding
             )
             pred = float(estimator.predict(x_row)[0])
 
@@ -181,6 +227,10 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
         "weather_file": args.weather_file,
         "weather_cols": args.weather_cols if args.weather_file else [],
         "weather_mode": args.weather_mode if args.weather_file else None,
+        "exog_file": args.exog_file,
+        "exog_cols": list(exog.columns) if exog is not None else [],
+        "origin_hour": args.origin_hour,
+        "snapshot_lag_hours": args.snapshot_lag_hours,
         "origins_skipped_no_snapshot": n_skipped_no_snapshot,
         "n_origins": len(usable),
         "first_origin": str(usable[0]),
@@ -369,6 +419,16 @@ def main() -> None:
         "--step", type=int, default=48,
         help="Hours between forecast origins",
     )
+    ap.add_argument(
+        "--origin_hour", type=int, default=None,
+        help="Local clock hour (0-23) of every origin (= last known price hour); needs --step multiple of 24. "
+        "23 = forecast made ~12:00 the same day, before tomorrow's prices are published. Output tag gets _o<hour>.",
+    )
+    ap.add_argument(
+        "--snapshot_lag_hours", type=int, default=0,
+        help="archive mode: snapshots must be issued at least this many hours before the origin "
+        "(the decision is made earlier than the last known price hour; 11 for --origin_hour 23)",
+    )
     ap.add_argument("--horizon", type=int, default=48)
     ap.add_argument("--refit_every", type=int, default=720, help="Refit every N hours (default 30 days)")
     ap.add_argument("--min_train_hours", type=int, default=8760)
@@ -382,6 +442,8 @@ def main() -> None:
         "archive: predict with MET snapshots issued before each origin (realistic)",
     )
     ap.add_argument("--weather_archive", default=ARCHIVE_DIR)
+    ap.add_argument("--exog_file", default=None, help="ENTSO-E exog parquet (wind/solar forecasts, neighbour prices); see exog.py")
+    ap.add_argument("--exog_cols", nargs="+", default=None, help="Exog columns (default: all in the file)")
     ap.add_argument("--out_csv", default=None)
     ap.add_argument("--out_summary", default=None)
     ap.add_argument("--out_png", default=None)
@@ -402,6 +464,10 @@ def main() -> None:
     tag = f"{args.model}_{meta['encoding']}"
     if args.weather_file:
         tag += "_wx" if args.weather_mode == "observed" else "_wxfc"
+    if args.exog_file:
+        tag += "_ex"
+    if args.origin_hour is not None:
+        tag += f"_o{args.origin_hour}"
     out_csv = repo_path(args.out_csv or f"data/backtest_rolling_{tag}.csv")
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)

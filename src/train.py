@@ -28,6 +28,7 @@ import pandas as pd
 from joblib import dump
 
 import features as F
+import exog as X_
 import models as M
 from config import TZ, repo_path
 from metrics import summarize
@@ -61,6 +62,14 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["temperature_C", "wind_speed_ms", "precipitation_mm"],
     )
+    ap.add_argument(
+        "--exog_file",
+        default=None,
+        help="ENTSO-E exog parquet from fetch_entsoe_exog.py: day-ahead wind/solar forecasts of neighbouring "
+        "zones (at the target hour, NaN where not yet published) and neighbour prices (at the origin). "
+        "See exog.py.",
+    )
+    ap.add_argument("--exog_cols", nargs="+", default=None, help="Exog columns to use (default: all in the file)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--no_embargo",
@@ -116,6 +125,13 @@ def main() -> None:
         history = history.iloc[F.MAX_HISTORY_HOURS :]
         df = df.iloc[F.MAX_HISTORY_HOURS :]
 
+    exog = None
+    if args.exog_file:
+        exog = X_.load_exog(args.exog_file)
+        if args.exog_cols:
+            exog = exog[args.exog_cols]
+        print(f"Exog features: {list(exog.columns)}")
+
     if args.val_start:
         val_start = pd.Timestamp(args.val_start, tz=TZ)
     else:
@@ -126,7 +142,7 @@ def main() -> None:
 
     clear_stale_models(out_dir, horizons)
 
-    print(f"Model: {args.model}   encoding: {encoding}   features: {len(F.feature_columns(encoding)) + (len(weather.columns) if weather is not None else 0)}")
+    print(f"Model: {args.model}   encoding: {encoding}   features: {len(F.feature_columns(encoding)) + (len(weather.columns) if weather is not None else 0) + (len(X_.feature_names(exog.columns)) if exog is not None else 0)}")
     print(f"Rows: {len(df):,}   span {df.index[0]} .. {df.index[-1]}")
     print(f"Validation starts: {val_start}   embargo: {'h hours' if embargo else 'DISABLED'}")
 
@@ -137,7 +153,7 @@ def main() -> None:
         target_col = F.target_column(horizon)
         y_all = df[target_col]
         labelled = y_all.notna()
-        X_all = F.assemble(history, df.index[labelled], horizon, encoding, weather=weather)
+        X_all = F.assemble(history, df.index[labelled], horizon, encoding, weather=weather, exog=exog)
         y_all = y_all[labelled]
 
         train_end = val_start - pd.Timedelta(hours=horizon) if embargo else val_start
@@ -150,7 +166,7 @@ def main() -> None:
 
         estimator = M.build_estimator(
             args.model, encoding, alpha=args.alpha, seed=args.seed,
-            extra_cols=[c for c in X_all.columns if c.endswith("_target")],
+            extra_cols=[c for c in X_all.columns if c not in F.feature_columns(encoding)],
         )
         fit_info = M.fit_estimator(args.model, estimator, X_train, y_train)
 
@@ -236,6 +252,8 @@ def main() -> None:
         "feature_file": str(feature_path),
         "weather_file": args.weather_file,
         "weather_cols": list(weather.columns) if weather is not None else [],
+        "exog_file": args.exog_file,
+        "exog_cols": list(exog.columns) if exog is not None else [],
         "feature_definition": F.feature_definition(encoding),
         "val_start": str(val_start),
         "embargo": embargo,
