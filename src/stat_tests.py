@@ -1,9 +1,10 @@
 """Significance tests on backtest results, with one MAE per forecast origin.
 
-Two methods: Wilcoxon signed-rank test. Three or more: Friedman test with the
-Iman-Davenport correction, then pairwise Wilcoxon tests with Holm correction.
+Two methods: Wilcoxon signed-rank test (two models). Three or more: Friedman test
+with Iman-Davenport correction, then pairwise Wilcoxon tests with Holm adjustment.
 
-    python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_rf_trig.csv --baselines
+    python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_ridge_trig.csv --baselines
+    python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_trig.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv --baselines --out_csv data/stat_tests.csv
 """
 
 from __future__ import annotations

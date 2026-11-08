@@ -3,8 +3,18 @@
 For each origin, every horizon is forecast with a model trained only on labels
 known at the last refit time. Models are refit every --refit_every hours.
 
-    python src/backtest_rolling.py --model ridge_ohe --start "2026-01-01 00:00" --end "2026-08-31 00:00"
-    python src/backtest_rolling.py --compare data/backtest_rolling_*.csv
+Weather (optional, --weather_file): adds the weather at t+h as features. Training
+always uses observed weather. --weather_mode controls prediction:
+  observed  observed weather (oracle / upper bound; default)
+  archive   latest archived MET snapshot issued at or before each origin, with no
+            fallback to observations. Origins without a snapshot are skipped.
+Outputs get the suffix _wx (observed) or _wxfc (archive); compare them with the
+price-only run using --compare.
+
+    python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model lgbm --encoding int --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48
+    python src/backtest_rolling.py --model ridge_ohe --encoding both --start "2026-01-01 00:00" --end "2026-08-31 00:00"
+    python src/backtest_rolling.py --model lgbm --encoding int --weather_file data/weather_oslo.parquet --weather_mode observed --start "2026-01-01 00:00" --end "2026-08-31 00:00"
+    python src/backtest_rolling.py --compare data/backtest_rolling_lgbm_int.csv data/backtest_rolling_ridge_ohe_both.csv
 """
 
 from __future__ import annotations
@@ -36,6 +46,7 @@ from plotting import (
     style_legend,
 )
 from price_io import load_price_series
+from weather_io import ARCHIVE_DIR, load_observed, pick_snapshot, weather_for_forecast
 
 DEFAULT_INPUT = "data/entsoe_NO_1_2020-01-01_now.parquet"
 
@@ -55,6 +66,17 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
     encoding = args.encoding or M.DEFAULT_ENCODING[args.model]
     complete = ~history.isna().any(axis=1)
 
+    # Weather at the target hour. Training always uses observed weather.
+    #   observed: predictions also use observed weather (oracle, upper bound)
+    #   archive:  predictions use the latest archived MET snapshot issued <= origin
+    #             (realistic; only origins with a snapshot are evaluated)
+    weather_obs = None
+    extra_cols: list[str] = []
+    if args.weather_file:
+        weather_obs = load_observed(args.weather_file, args.weather_cols)
+        extra_cols = [f"{c}_target" for c in args.weather_cols]
+        print(f"Weather: {args.weather_cols} from {args.weather_file}   prediction mode: {args.weather_mode}")
+
     origins = pd.date_range(to_tz(args.start), to_tz(args.end), freq=f"{args.step}h", tz=TZ)
     usable = [
         o
@@ -63,6 +85,15 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
         and complete.loc[o]
         and o + pd.Timedelta(hours=args.horizon) <= price.index.max()
     ]
+    n_skipped_no_snapshot = 0
+    if weather_obs is not None and args.weather_mode == "archive":
+        with_snap = [o for o in usable if pick_snapshot(o, args.weather_archive) is not None]
+        n_skipped_no_snapshot = len(usable) - len(with_snap)
+        if n_skipped_no_snapshot:
+            print(f"Skipping {n_skipped_no_snapshot} origins with no forecast snapshot issued at/before them")
+        usable = with_snap
+    if not usable:
+        raise ValueError("No usable origins (check --start/--end, and the snapshot archive for --weather_mode archive)")
     print(f"Model: {args.model}   encoding: {encoding}")
     print(f"Origins: {len(usable)}  ({usable[0]} .. {usable[-1]}, step {args.step}h)")
     print(f"Horizons: 1..{args.horizon}   refit every {args.refit_every}h")
@@ -81,6 +112,17 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
 
         origin_price = float(price.loc[origin])
 
+        weather_at_origin = weather_obs
+        if weather_obs is not None and args.weather_mode == "archive":
+            # Snapshot only: no observed fallback, so no future observations leak in.
+            weather_at_origin, _ = weather_for_forecast(
+                args.weather_cols,
+                origin + pd.to_timedelta(horizons, unit="h"),
+                origin,
+                args.weather_archive,
+                observed_path=None,
+            )
+
         for h in horizons:
             estimator = cache.get(h)
             if estimator is None:
@@ -97,12 +139,12 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
                     )
 
                 X = M.prepare_X(
-                    args.model, F.assemble(history, train_index, h, encoding), encoding
+                    args.model, F.assemble(history, train_index, h, encoding, weather=weather_obs), encoding
                 )
                 y = targets.loc[train_index, F.target_column(h)].to_numpy(dtype=float)
 
                 estimator = M.build_estimator(
-                    args.model, encoding, alpha=args.alpha, seed=args.seed
+                    args.model, encoding, alpha=args.alpha, seed=args.seed, extra_cols=extra_cols
                 )
                 info = M.fit_estimator(args.model, estimator, X, y)
                 cache[h] = estimator
@@ -110,7 +152,7 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
                     fit_notes.append({"anchor": str(anchor), **info})
 
             x_row = M.prepare_X(
-                args.model, F.assemble(history, [origin], h, encoding), encoding
+                args.model, F.assemble(history, [origin], h, encoding, weather=weather_at_origin), encoding
             )
             pred = float(estimator.predict(x_row)[0])
 
@@ -136,6 +178,10 @@ def run_backtest(args) -> tuple[pd.DataFrame, dict]:
         "model": args.model,
         "encoding": encoding,
         "feature_definition": F.feature_definition(encoding),
+        "weather_file": args.weather_file,
+        "weather_cols": args.weather_cols if args.weather_file else [],
+        "weather_mode": args.weather_mode if args.weather_file else None,
+        "origins_skipped_no_snapshot": n_skipped_no_snapshot,
         "n_origins": len(usable),
         "first_origin": str(usable[0]),
         "last_origin": str(usable[-1]),
@@ -328,6 +374,14 @@ def main() -> None:
     ap.add_argument("--min_train_hours", type=int, default=8760)
     ap.add_argument("--alpha", default="auto", help="Ridge alpha, or 'auto' for RidgeCV")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--weather_file", default=None, help="Observed weather parquet; adds weather at t+h as features")
+    ap.add_argument("--weather_cols", nargs="+", default=["temperature_C", "wind_speed_ms", "precipitation_mm"])
+    ap.add_argument(
+        "--weather_mode", choices=["observed", "archive"], default="observed",
+        help="observed: predict with observed weather (upper bound). "
+        "archive: predict with MET snapshots issued before each origin (realistic)",
+    )
+    ap.add_argument("--weather_archive", default=ARCHIVE_DIR)
     ap.add_argument("--out_csv", default=None)
     ap.add_argument("--out_summary", default=None)
     ap.add_argument("--out_png", default=None)
@@ -346,6 +400,8 @@ def main() -> None:
     meta["eur_nok"] = EUR_TO_NOK
 
     tag = f"{args.model}_{meta['encoding']}"
+    if args.weather_file:
+        tag += "_wx" if args.weather_mode == "observed" else "_wxfc"
     out_csv = repo_path(args.out_csv or f"data/backtest_rolling_{tag}.csv")
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)

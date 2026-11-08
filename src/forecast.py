@@ -1,6 +1,16 @@
 """Forecast the next 48 hours from the last observed price.
 
-    python src/forecast.py --model_dir models/lgbm_int --save_png
+Loads a trained model and generates forecasts with prediction intervals.
+
+Weather models (manifest lists weather_cols) also need weather at origin+h. It is
+taken from the latest archived MET snapshot issued at or before --weather_as_of
+(default: now, or the --origin if one is given); hours the snapshot does not
+cover fall back to observed weather (--weather_obs, default: the file the model
+was trained with). The run prints how many values came from each source and
+stores the details under "weather" in the JSON output. Price-only models ignore
+all of this.
+
+    python src/forecast.py --price data/entsoe_NO_1_2020-01-01_now.parquet --model_dir models/lgbm_int --horizon 48 --save_png
 """
 
 from __future__ import annotations
@@ -21,6 +31,7 @@ import models as M
 from config import EUR_TO_NOK, ROOT, TZ, repo_path
 from plotting import save_figure
 from price_io import load_price_series
+from weather_io import ARCHIVE_DIR, weather_for_forecast
 
 DEFAULT_PRICE = "data/entsoe_NO_1_2020-01-01_now.parquet"
 
@@ -51,6 +62,13 @@ def main() -> None:
     ap.add_argument("--out_json", default=None)
     ap.add_argument("--horizon", type=int, default=48)
     ap.add_argument("--origin", default=None, help="Override the forecast origin timestamp")
+    ap.add_argument("--weather_archive", default=ARCHIVE_DIR, help="MET forecast snapshots (weather models only)")
+    ap.add_argument("--weather_obs", default=None, help="Observed weather parquet (default: the file the model was trained with)")
+    ap.add_argument(
+        "--weather_as_of",
+        default=None,
+        help="Use the latest snapshot issued at/before this time (default: now, or --origin if given)",
+    )
     ap.add_argument("--save_png", action="store_true")
     ap.add_argument("--history_hours", type=int, default=72, help="History shown in the plot")
     args = ap.parse_args()
@@ -76,6 +94,30 @@ def main() -> None:
         origin = observed.index[-1]
 
     history = F.history_features(price)
+
+    # Weather-trained models need weather at origin+h: archived forecast where it
+    # covers the hour, observations otherwise. Models without weather skip this.
+    weather_cols = manifest.get("weather_cols") or []
+    weather, weather_info = None, None
+    if weather_cols:
+        if args.weather_as_of:
+            as_of = pd.Timestamp(args.weather_as_of)
+            as_of = as_of.tz_localize(TZ) if as_of.tzinfo is None else as_of
+        else:
+            as_of = origin if args.origin else pd.Timestamp.now(tz=TZ)
+        targets = origin + pd.to_timedelta(range(1, args.horizon + 1), unit="h")
+        weather, weather_info = weather_for_forecast(
+            weather_cols, targets, as_of, args.weather_archive, args.weather_obs or manifest.get("weather_file"),
+        )
+        print(
+            f"Weather: snapshot {weather_info['snapshot_issued_at']}   "
+            f"snapshot cells {weather_info['cells_from_snapshot']}, observed {weather_info['cells_from_observed']}, "
+            f"missing {weather_info['cells_missing']} of {weather_info['cells_total']}"
+        )
+        if weather_info["snapshot_issued_at"] is None:
+            print("  WARNING: no forecast snapshot found - using observations only; run fetch_weather_forecast.py")
+        if weather_info["cells_missing"]:
+            print("  WARNING: missing weather values are passed to the model as NaN")
     print(
         f"Model: {model_name}   encoding: {encoding}   horizons: {len(models)}   "
         f"trained {manifest.get('trained_at', '?')[:16]}"
@@ -85,7 +127,12 @@ def main() -> None:
     rows = []
     for h in sorted(models):
         payload = models[h]["payload"]
-        X = F.assemble(history, [origin], h, encoding)
+        X = F.assemble(history, [origin], h, encoding, weather=weather)
+        if list(X.columns) != list(payload["features"]):
+            raise RuntimeError(
+                f"t+{h}h: model expects {len(payload['features'])} features, built {X.shape[1]}. "
+                "Model/manifest mismatch (weather columns)?"
+            )
 
         X = M.prepare_X(payload["model"], X, encoding)
         pred = float(payload["estimator"].predict(X)[0])
@@ -116,6 +163,7 @@ def main() -> None:
         "encoding": encoding,
         "model_dir": str(model_dir),
         "model_trained_at": manifest.get("trained_at"),
+        "weather": weather_info,
         "eur_nok": EUR_TO_NOK,
         "interval_method": models[min(models)]["intervals"].get("method"),
         "horizons": [

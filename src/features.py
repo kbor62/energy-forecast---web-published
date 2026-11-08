@@ -4,6 +4,12 @@ History features (lags, rolling statistics, differences) describe the forecast
 origin t and use only prices at or before t. Calendar features describe the
 target hour t+h. ``assemble`` pairs the two and is used by training,
 backtesting and forecasting alike.
+
+Weather (optional): ``assemble(..., weather=df)`` appends ``<col>_target`` columns
+holding the weather at the target hour t+h. They are not part of
+``feature_columns``; the caller (train / forecast / backtest) supplies them. In
+training and the default backtest the values are observed weather, i.e. an
+upper bound on what a real forecast delivers (see README section 13).
 """
 
 from __future__ import annotations
@@ -134,14 +140,30 @@ def assemble(
     origins,
     horizon: int,
     encoding: str = "trig",
+    weather: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Design matrix: history at each origin, calendar at origin + horizon."""
+    """Design matrix: history at each origin, calendar at origin + horizon.
+
+    If ``weather`` (hourly, indexed by time) is given, its columns are added as
+    ``<col>_target``: the weather at the target hour origin + horizon. In
+    training this is observed weather (an upper bound); at inference it must be
+    replaced by archived/real forecast values.
+    """
     origins = pd.DatetimeIndex(origins)
-    calendar = calendar_features(origins + pd.Timedelta(hours=horizon), encoding)
+    targets = origins + pd.Timedelta(hours=horizon)
+    calendar = calendar_features(targets, encoding)
     calendar.index = origins
 
-    X = pd.concat([calendar, history.loc[origins, HISTORY_COLS]], axis=1)
-    return X.loc[:, feature_columns(encoding)]
+    parts = [calendar, history.loc[origins, HISTORY_COLS]]
+    if weather is not None:
+        w = weather.reindex(targets)
+        w.index = origins
+        parts.append(w.add_suffix("_target"))
+    X = pd.concat(parts, axis=1)
+    cols = feature_columns(encoding)
+    if weather is not None:
+        cols = cols + [f"{c}_target" for c in weather.columns]
+    return X.loc[:, cols]
 
 
 def as_categorical(X: pd.DataFrame, cat_cols: list[str]) -> pd.DataFrame:

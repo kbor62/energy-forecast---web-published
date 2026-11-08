@@ -1,7 +1,16 @@
 """Exploratory data analysis of the price series: figures in figs/eda/ and
 tables in data/ (eda_summary_by_year.csv, eda_outliers.csv, eda_meta.json).
 
+Outputs:
+  - figs/eda/*.png: timeseries, distribution, by-hour, by-month, heatmap, ACF, outliers
+  - data/eda_summary_by_year.csv: annual statistics
+  - data/eda_outliers.csv: flagged anomalies
+  - data/eda_meta.json: settings and headline statistics
+
+Examples:
     python src/eda.py
+    python src/eda.py --k_spike 5  # Spike threshold (default 6)
+    python src/eda.py --acf_max_lag 240  # Maximum ACF lag (default 336)
 """
 
 from __future__ import annotations

@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.model_selection import TimeSeriesSplit
@@ -19,19 +16,13 @@ import features as F
 import lightgbm
 from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 
-# Silence a harmless scikit-learn warning repeated on every RF prediction.
-warnings.filterwarnings(
-    "ignore", message=r".*sklearn\.utils\.parallel\.delayed.*", category=UserWarning
-)
-
-MODELS = ("lgbm", "ridge", "ridge_ohe", "rf")
+MODELS = ("lgbm", "ridge", "ridge_ohe")
 
 # Default calendar encoding per model.
 DEFAULT_ENCODING = {
     "lgbm": "int",
     "ridge": "trig",
     "ridge_ohe": "both",
-    "rf": "trig",
 }
 
 LGBM_PARAMS = dict(
@@ -47,8 +38,6 @@ LGBM_PARAMS = dict(
     verbose=-1,
 )
 
-RF_PARAMS = dict(n_estimators=300, max_depth=15, min_samples_split=10, n_jobs=-1)
-
 
 def _one_hot_encoder(cat_cols: list[str]) -> OneHotEncoder:
     """One-hot encoder with fixed category levels."""
@@ -56,22 +45,18 @@ def _one_hot_encoder(cat_cols: list[str]) -> OneHotEncoder:
     return OneHotEncoder(categories=categories, handle_unknown="ignore", sparse_output=False)
 
 
-def build_estimator(model: str, encoding: str, alpha="auto", seed: int = 42):
-    """Return an unfitted estimator for ``model``."""
+def build_estimator(model: str, encoding: str, alpha="auto", seed: int = 42, extra_cols=()):
+    """Return an unfitted estimator for ``model``.
+
+    ``extra_cols``: additional numeric feature columns (e.g. weather ``*_target``);
+    without them the ridge models would silently drop those columns.
+    """
     cat_cols = F.categorical_columns(encoding)
-    num_cols = [c for c in F.feature_columns(encoding) if c not in cat_cols]
+    num_cols = [c for c in F.feature_columns(encoding) if c not in cat_cols] + list(extra_cols)
 
     if model == "lgbm":
         # No imputer: LightGBM handles missing values itself.
         return LGBMRegressor(random_state=seed, **LGBM_PARAMS)
-
-    if model == "rf":
-        return Pipeline(
-            [
-                ("imputer", SimpleImputer(strategy="median")),
-                ("model", RandomForestRegressor(random_state=seed, **RF_PARAMS)),
-            ]
-        )
 
     # Ridge: impute and scale the numeric columns only.
     numeric = Pipeline(
@@ -115,9 +100,6 @@ def fit_estimator(
 
     if model != "lgbm":
         estimator.fit(X, y)
-        if model == "rf":
-            # Predict on one core; the backtest predicts one row at a time.
-            estimator.named_steps["model"].set_params(n_jobs=1)
         inner = getattr(estimator, "named_steps", {}).get("model")
         if hasattr(inner, "alpha_"):
             info["alpha"] = float(inner.alpha_)
@@ -132,7 +114,7 @@ def fit_estimator(
     X_fit, y_fit = X.iloc[:n_fit], y[:n_fit]
     X_stop, y_stop = X.iloc[n_fit:], y[n_fit:]
     estimator.fit(
-        X_fit, y_fit, eval_X=X_stop, eval_y=y_stop, eval_metric="l1",
+        X_fit, y_fit, eval_set=[(X_stop, y_stop)], eval_metric="l1",
         callbacks=[early_stopping(100, verbose=False), log_evaluation(0)],
     )
     info["n_early_stopping_rows"] = int(n_val)

@@ -2,3 +2,8 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Generated results: only source code is versioned (see README section 13.5)
+data/
+models/
+figs/

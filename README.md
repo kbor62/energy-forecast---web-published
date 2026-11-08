@@ -1,7 +1,8 @@
 ===============================================================================
  REPRODUCING ALL DATA, MODELS, FORECASTS AND FIGURES
  Electricity Price Forecasting Using Machine Learning (NO1) - Kjetil Borg
- State as of 22 September 2026
+ State as of 22 September 2026 (price-only results); weather extension
+ added 6 November 2026 (section 13)
 ===============================================================================
 
 This file lists, step by step, how every data file, model, forecast, figure and
@@ -12,6 +13,7 @@ python (.\.venv\Scripts\python.exe on Windows).
 
 Contents
   0. What "reproduce" means here (two modes)
+  0a. Convenience: wrapper script (optional)
   1. Environment
   2. Configuration
   3. Step 1 - Download prices
@@ -24,18 +26,24 @@ Contents
  10. Where each figure and table in the report comes from
  11. Reference values for checking a reproduction
  12. Numbers computed from the backtest CSVs
+ 13. Weather extension: observed weather, forecast snapshots, pipeline flag
 
 -------------------------------------------------------------------------------
 0. WHAT "REPRODUCE" MEANS HERE (TWO MODES)
 -------------------------------------------------------------------------------
 
 Mode A - exact reproduction (recommended for checking the report)
-  Use the saved price file data\entsoe_NO_1_2020-01-01_now.parquet as it is
-  (84,666 rows, 2020-01-01 00:00 to 2026-09-22 23:45, fetched 21 Sep 2026
-  13:39). Skip step 1. Every later step is
-  deterministic (fixed seed 42, fixed exchange rate), so the numbers in
-  section 11 should be reproduced to the last printed decimal with the same
-  library versions.
+  Use the price file from 21 Sep 2026 (84,666 rows, 2020-01-01 00:00 to
+  2026-09-22 23:45, fetched 21 Sep 2026 13:39). Results are not versioned
+  (data\, models\ and figs\ are git-ignored), but this one file is still in the
+  git history, commit 928e127. Restore it (this overwrites the current file; copy
+  it away first if you want to keep it):
+
+    git show 928e127:data/entsoe_NO_1_2020-01-01_now.parquet > data/entsoe_NO_1_2020-01-01_now.parquet
+
+  Then skip step 1. Every later step is deterministic (fixed seed 42, fixed
+  exchange rate), so the numbers in section 11 should be reproduced to the last
+  printed decimal with the same library versions.
 
 Mode B - fresh reproduction from the API
   Download the prices again (step 1). If you download without an end date you
@@ -45,6 +53,28 @@ Mode B - fresh reproduction from the API
   bit-identical. To come as close as possible to Mode A, fetch with
   --end 2026-09-23 (see step 1). ENTSO-E can revise published data, so even
   then exact equality is not guaranteed.
+
+Note (6 Nov 2026): the price file in the working tree was refreshed on 30 Oct
+  2026 (88,414 rows to 2026-10-31 23:45). With that file, or any later download,
+  the numbers in section 11 will differ (Mode B). Use the restored 21 Sep file
+  (Mode A) for checking section 11.
+
+
+-------------------------------------------------------------------------------
+
+For a hands-off run of the complete pipeline (steps 1-5), use the Python
+convenience wrapper:
+
+  python run_pipeline.py                              # Run with defaults
+  python run_pipeline.py --model ridge_ohe --encoding both
+  python run_pipeline.py --skip-fetch --model lgbm
+  python run_pipeline.py --backtest --backtest-start "2026-01-01 00:00" --backtest-end "2026-08-31 00:00"
+  python run_pipeline.py --weather                    # add weather (section 13)
+
+With --weather the wrapper also fetches weather, trains with it and forecasts
+from the latest forecast snapshot (section 13.6). Run `python run_pipeline.py
+--help` for all options. This script is optional;
+you can always run the steps individually as described below.
 
 
 -------------------------------------------------------------------------------
@@ -90,6 +120,8 @@ Mode B - fresh reproduction from the API
       copy .env.example .env
       (then edit .env)   ENTSOE_TOKEN=<your own ENTSO-E API token>
 
+  For the weather extension also set FROST_CLIENT_ID in .env (section 13.3).
+
   .env is git-ignored. Never commit it.
 
 -------------------------------------------------------------------------------
@@ -128,8 +160,7 @@ Step 2 - features (once):
 
   python src/build_features.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --out data/features_price_only.parquet --horizon 48
 
-Steps 3-5 for the five variants used in the report, in the order they were
-run (random forest last, it is slow):
+Steps 3-5 for the four variants used in the report:
 
   lgbm_int:
     python src/train.py --inp data/features_price_only.parquet --model lgbm --encoding int --horizon 48 --val_days 30
@@ -151,16 +182,11 @@ run (random forest last, it is slow):
     python src/forecast.py --price data/entsoe_NO_1_2020-01-01_now.parquet --model_dir models/ridge_ohe_both --horizon 48 --save_png
     python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model ridge_ohe --encoding both --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48
 
-  rf_trig:
-    python src/train.py --inp data/features_price_only.parquet --model rf --encoding trig --horizon 48 --val_days 30
-    python src/forecast.py --price data/entsoe_NO_1_2020-01-01_now.parquet --model_dir models/rf_trig --horizon 48 --save_png
-    python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model rf --encoding trig --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48
-
 Every variant must use the same price file. In Mode B, run step 1 first and do
 not download again between variants.
 
 The reported results were produced by these same commands, run through a
-PowerShell wrapper script that is not part of the delivery.
+Python wrapper script included in the repository as run_pipeline.py.
 
 Backtest settings used:
   origins 2026-01-01 00:00 .. 2026-08-29 01:00, step 48 h -> 121 origins
@@ -170,12 +196,7 @@ Backtest settings used:
 Training settings:
   horizon 48, val_days 30 (validation starts 2026-08-23 22:00 in Mode A),
   Ridge alpha chosen by RidgeCV (logspace -3..3, TimeSeriesSplit 3),
-  LightGBM early stopping 100 rounds on a 10 % time-ordered tail,
-  Random forest 300 trees, max_depth 15, min_samples_split 10.
-
-Run times on the machine used: under 2 minutes of training per variant for
-LightGBM and ridge, about 31 minutes for the random forest. The random forest
-backtest refits nine times and takes several hours; it is not hanging.
+  LightGBM early stopping 100 rounds on a 10 % time-ordered tail.
 
 
 -------------------------------------------------------------------------------
@@ -201,22 +222,21 @@ backtest refits nine times and takes several hours; it is not hanging.
 6. STEP 7 - MODEL COMPARISON ACROSS HORIZONS
 -------------------------------------------------------------------------------
 
-  python src/backtest_rolling.py --compare data/backtest_rolling_lgbm_int.csv data/backtest_rolling_ridge_ohe_both.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_rf_trig.csv
+  python src/backtest_rolling.py --compare data/backtest_rolling_lgbm_int.csv data/backtest_rolling_ridge_ohe_both.csv data/backtest_rolling_ridge_trig.csv
 
   Output: figs\compare_by_horizon.png  (report Figure 5)
   Prints aggregate MAE / nMAE per model and both baselines.
-  The plot accepts at most four runs; lgbm_trig is left out of the figure.
 
 
 -------------------------------------------------------------------------------
 7. STEP 8 - STATISTICAL TESTS (Friedman / Iman-Davenport, Wilcoxon + Holm)
 -------------------------------------------------------------------------------
 
-  All five variants plus both baselines, all horizons and per half:
+  All four variants plus both baselines, all horizons and per half:
 
-  python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_trig.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv data/backtest_rolling_rf_trig.csv --baselines --out_csv data/stat_tests_all.csv
-  python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_trig.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv data/backtest_rolling_rf_trig.csv --baselines --horizons 1-24 --out_csv data/stat_tests_1-24.csv
-  python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_trig.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv data/backtest_rolling_rf_trig.csv --baselines --horizons 25-48 --out_csv data/stat_tests_25-48.csv
+  python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_trig.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv --baselines --out_csv data/stat_tests_all.csv
+  python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_trig.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv --baselines --horizons 1-24 --out_csv data/stat_tests_1-24.csv
+  python src/stat_tests.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_trig.csv data/backtest_rolling_ridge_trig.csv data/backtest_rolling_ridge_ohe_both.csv --baselines --horizons 25-48 --out_csv data/stat_tests_25-48.csv
 
   Calendar-encoding ablation (single planned test):
 
@@ -234,7 +254,7 @@ backtest refits nine times and takes several hours; it is not hanging.
 8. STEP 9 - FEATURE IMPORTANCE
 -------------------------------------------------------------------------------
 
-  python src/feature_importance.py --model_dir models/lgbm_int models/ridge_ohe_both models/rf_trig
+  python src/feature_importance.py --model_dir models/lgbm_int models/ridge_ohe_both
 
   Defaults: horizons 1 6 12 24 36 48, 10 repeats, seed 42,
   evaluation window = each model's own validation window (val_start in the
@@ -254,7 +274,7 @@ backtest refits nine times and takes several hours; it is not hanging.
 
   python tests/test_pipeline.py        (or: pytest tests/)
 
-  Expected: 13/13 passed.
+  Expected: 19/19 passed (13 pipeline tests + 6 weather tests, section 13.8).
 
 -------------------------------------------------------------------------------
 10. WHERE EACH FIGURE AND TABLE IN THE REPORT COMES FROM
@@ -291,15 +311,14 @@ Rolling backtest, 121 origins x 48 horizons, NOK/kWh (printed by each run)
   lgbm_trig        0.1798   0.2681   16.2 %
   ridge_trig       0.1777   0.2582   16.1 %
   ridge_ohe_both   0.1765   0.2555   15.9 %
-  rf_trig          0.1871   0.2752   16.9 %
   persistence      0.2253   0.3480   20.4 %
   weekly t-168     0.2469   0.3539   22.3 %
 
-Statistical tests (all horizons, 5 variants + 2 baselines)
-  Friedman chi2 = 114.63, Iman-Davenport F = 22.50
-  mean ranks: lgbm_int 3.11, ridge_ohe_both 3.37, lgbm_trig 3.56,
-              ridge_trig 3.62, rf_trig 3.98, weekly 4.96, persistence 5.40
-  lgbm_int vs rf_trig Holm p = 0.040; lgbm_int vs lgbm_trig unadjusted p = 0.019
+Statistical tests (all horizons, 4 variants + 2 baselines)
+  Friedman chi2 = 42.19, Iman-Davenport F = 13.25
+  mean ranks: lgbm_int 2.47, ridge_ohe_both 2.62, lgbm_trig 2.77,
+              ridge_trig 2.88, weekly 4.63, persistence 5.64
+  lgbm_int vs ridge_trig Holm p = 0.077; lgbm_int vs lgbm_trig unadjusted p = 0.221
 
 LightGBM (int) early stopping, final models: 972 trees at 1 h, 552 at 6 h,
 336 at 24 h, 230 at 48 h.
@@ -321,3 +340,150 @@ Forecast origin in Mode A: 2026-09-22 23:00 (price 0.1474 EUR/kWh).
   - Spike analysis (10.1): hours with actual >= 95th percentile of actual.
   - 15-minute effect (7.1): |price at hh:00 - mean of hh:00..hh:45|, Oct 2025
     onwards, from the raw parquet.
+
+
+-------------------------------------------------------------------------------
+13. WEATHER EXTENSION (added 6 November 2026)
+-------------------------------------------------------------------------------
+
+Sections 1-12 describe the price-only models and are unchanged: without any of
+the weather options everything below is inactive and the reported numbers
+(section 11) are reproduced exactly as before. Weather is an optional add-on.
+
+13.1 Idea and what the numbers mean
+  A weather model gets, for target hour t+h, the temperature, wind speed and
+  precipitation at t+h as extra features (columns <name>_target, e.g.
+  temperature_C_target), next to the price features. Station: Oslo (Blindern,
+  SN18700) for observations; Oslo coordinates for the MET forecast.
+
+  Observed vs forecast weather - read this before quoting any result:
+    * Training (train.py) and the default backtest use OBSERVED weather at t+h.
+      That is what happened, not what was forecast, so the validation/backtest
+      scores are an UPPER BOUND on the gain from weather. In a quick check
+      (last 30 days, LightGBM) validation MAE improved 1-6 % at h = 1, 12, 24
+      and 48 with observed weather (this is not a report number).
+    * In live use forecast.py has only a MET forecast. The model was trained on
+      perfect weather and is served imperfect weather (train/serve mismatch).
+    * The only honest measurement is to predict with the forecast that existed
+      at each origin. That requires archived forecasts (13.5), so it can only
+      cover the period since archiving started.
+
+13.2 Files and directories
+  src\weather_io.py          snapshot lookup and weather-at-target assembly
+  src\fetch_weather.py       observed hourly weather (Frost) -> data\weather_oslo.parquet
+  src\fetch_weather_forecast.py   MET forecast -> data\weather_forecast.parquet (latest,
+                             overwritten) + data\forecast_archive\ (every run, kept)
+  data\weather_oslo.parquet  observed: temperature_C, wind_speed_ms, precipitation_mm
+                             (hourly, Europe/Oslo)
+  data\forecast_archive\metno_<YYYYmmddTHHMMZ>.parquet
+                             one MET model run as issued: index = valid time (UTC),
+                             columns oslo_/hamburg_/copenhagen_ x {temperature_C,
+                             wind_speed_ms, wind_from_direction, cloud_area_fraction,
+                             precipitation_mm}, plus issued_at
+  models\<model>_<enc>_wx\   weather-trained models (manifest has weather_file and
+                             weather_cols)
+  Not used by the pipeline: data\weather_combined.parquet, data\temperature_oslo.parquet,
+  data\features_price_temp*, features_price_weather*, features_weather_forecast*,
+  features_future_weather* (see 13.9).
+
+13.3 Configuration
+  Weather history needs a free Frost client id in .env:
+      FROST_CLIENT_ID=<your id>      (https://frost.met.no/auth/requestCredentials.html)
+  The MET forecast API needs no key (a User-Agent is set in the script). Extra
+  packages: requests, python-dateutil (listed in requirements.txt).
+
+13.4 Step by step
+  a) Observed weather history (re-run to extend it; fetches 2020 onwards):
+       python src/fetch_weather.py --out data/weather_oslo.parquet
+     Keep it as new as the price file; rows after its end train with NaN weather.
+  b) Forecast snapshot (see 13.5 for scheduling):
+       python src/fetch_weather_forecast.py
+  c) Train with weather (separate model directory):
+       python src/train.py --inp data/features_price_only.parquet --model lgbm --encoding int --horizon 48 --val_days 30 --weather_file data/weather_oslo.parquet --out_dir models/lgbm_int_wx
+     --weather_cols selects columns (default temperature_C wind_speed_ms
+     precipitation_mm). LightGBM accepts NaN; ridge imputes the median.
+  d) Forecast:
+       python src/forecast.py --price data/entsoe_NO_1_2020-01-01_now.parquet --model_dir models/lgbm_int_wx --horizon 48 --save_png
+     Weather at origin+h = latest snapshot issued at or before --weather_as_of
+     (default now; the --origin if you give one), observed weather for hours the
+     snapshot does not cover (--weather_obs, default the training file). The run
+     prints the number of values from snapshot / observed / missing; the same is
+     stored under "weather" in data\forecast_<model>_<enc>_wx.json. Missing values
+     are passed on as NaN with a warning. Outputs: data\forecast_<model>_<enc>_wx.*
+  e) Backtest (observed weather, upper bound):
+       python src/backtest_rolling.py --inp data/entsoe_NO_1_2020-01-01_now.parquet --model lgbm --encoding int --weather_file data/weather_oslo.parquet --weather_mode observed --start "2026-01-01 00:00" --end "2026-08-31 00:00" --step 48 --horizon 48
+     Realistic variant, only for origins that have an archived snapshot:
+       ... --weather_mode archive [--weather_archive data/forecast_archive]
+     In archive mode training still uses observed weather, predictions use only
+     the snapshot (no fallback to observations, so nothing from the future leaks
+     in), origins with no snapshot issued at or before them are skipped, and the
+     number skipped is stored in the _meta.json. Outputs get the suffix _wx
+     (observed) or _wxfc (archive), e.g. data\backtest_rolling_lgbm_int_wx.csv.
+  f) Compare with the price-only run on the same origins:
+       python src/backtest_rolling.py --compare data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_int_wx.csv
+  g) Quick A/B on the last 30 days (observed weather, all 48 horizons, slow):
+       python test_weather_forecast_value.py
+
+13.5 Archiving forecast snapshots (do this from now on)
+  MET updates the forecast roughly every hour, and the API gives only the
+  current forecast. Past forecasts cannot be fetched later, so each run must be
+  stored when it is available. fetch_weather_forecast.py does this automatically:
+  every run writes data\forecast_archive\metno_<issued>.parquet, named by MET's
+  own model-run time; the same run is never stored twice. Nothing runs by
+  itself - schedule it, e.g. every 6 hours with Windows Task Scheduler:
+      Program:    <repo>\.venv\Scripts\python.exe
+      Arguments:  src\fetch_weather_forecast.py
+      Start in:   <repo>
+  Each file is about 20 KB. Results are not versioned: .gitignore excludes data/,
+  models/ and figs/, so the archive lives only on this machine - back up
+  data\forecast_archive\ yourself, since past forecasts cannot be fetched again.
+  Options: --archive_dir, --no_archive.
+  After a few weeks the archive supports --weather_mode archive backtests.
+
+13.6 One-command pipeline
+  python run_pipeline.py --weather
+    1b) fetch_weather.py -> data\weather_oslo.parquet; fetch_weather_forecast.py
+        (a failed snapshot only warns); warns if the weather history ends >24 h
+        before the prices
+    3)  train.py ... --weather_file ... --out_dir models/<model>_<enc>_wx
+    4)  forecast.py --model_dir models/<model>_<enc>_wx
+  --weather-file changes the observed weather file; --skip-fetch skips the price
+  and the weather downloads (the existing files and the latest archived snapshot
+  are used). With --backtest, --backtest-weather-mode observed|archive picks the
+  prediction mode (13.4 e). Without --weather the pipeline is unchanged.
+
+13.7 How it is built (for review)
+  features.assemble(history, origins, h, encoding, weather=None) appends
+    <col>_target = weather at origin + h; no argument -> price-only features.
+  models.build_estimator(..., extra_cols=...) must list the weather columns,
+    otherwise the ridge models silently drop them; train.py and
+    backtest_rolling.py pass them. LightGBM takes all columns.
+  weather_io.pick_snapshot / weather_for_forecast: latest snapshot issued at or
+    before as_of; observed_path=None disables the fallback to observations.
+  forecast.py refuses to run if the built feature list differs from the
+    model's saved "features" (model/manifest mismatch).
+
+13.8 Tests  (python tests/test_pipeline.py  or  pytest tests/ ; expected 19/19)
+  The 13 tests of section 9 plus six weather tests: target-hour alignment of the
+  weather columns, price-only features unchanged without weather, ridge keeps the
+  weather columns, snapshot choice never looks ahead, snapshot-only mode has no
+  fallback to observations, archiving is idempotent.
+
+13.9 Known limits and legacy files
+  * One station (Oslo) stands in for NO1. Hamburg and Copenhagen forecasts are
+    archived but not used as features (no history to train on).
+  * The MET forecast is hourly for about 60 hours; beyond that it is 6-hourly and
+    precipitation is missing. The 48 h horizon is covered; the tail of the
+    archived snapshots has gaps.
+  * Reservoir filling (NVE) and cross-border flows are not implemented.
+  * Results with observed weather overstate the benefit (13.1); archive-mode
+    backtests are small until enough snapshots exist.
+  * backtest_rolling.py and forecast.py use one weather source per run; the
+    weather columns are the same set as in training.
+  * build_features.py --add-weather-forecast, combine_weather.py and the
+    features_*weather*/temperature files are LEGACY: train.py reads only the
+    price-history columns of a feature file, so those weather columns were never
+    used. A comparison based on them (including the earlier "weather does not
+    help" result of test_weather_hypothesis.py) is invalid. That script is
+    deprecated and refuses to run without --force because it overwrites
+    data\features_price_only.parquet.

@@ -11,5 +11,9 @@ joblib
 scipy
 python-dotenv
 
+# Needed by the weather fetchers (src/fetch_weather.py, src/fetch_weather_forecast.py).
+requests
+python-dateutil
+
 # Only needed for src/fetch_prices.py (step 1).
 entsoe-py

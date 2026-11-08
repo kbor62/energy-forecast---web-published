@@ -26,6 +26,10 @@ EUR_TO_NOK = 10.83
 # Used by fetch_prices.py only.
 ENTSOE_TOKEN = os.environ.get("ENTSOE_TOKEN", "")
 
+# MET Norway Frost API (https://frost.met.no/), read from .env.
+# Used by fetch_weather.py.
+FROST_CLIENT_ID = os.environ.get("FROST_CLIENT_ID", "")
+
 
 def repo_path(value: str | Path) -> Path:
     """Path relative to the repository root."""

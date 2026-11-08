@@ -4,7 +4,17 @@ The last --val_days days are held out for validation. Training for horizon h
 stops h hours before the validation window (the embargo), so that no training
 label falls inside it.
 
-    python src/train.py --model lgbm --encoding int --val_days 30
+    python src/train.py --inp data/features_price_only.parquet --model lgbm --encoding int --horizon 48 --val_days 30
+    python src/train.py --model ridge --encoding trig
+    python src/train.py --model ridge_ohe --encoding both
+
+Weather (optional): --weather_file adds the weather at the target hour t+h
+(<col>_target) as features, using OBSERVED values, so validation scores are an
+upper bound on the value of a weather forecast. Use a separate --out_dir
+(e.g. models/lgbm_int_wx) to keep the price-only models. The manifest records
+weather_file and weather_cols; forecast.py reads them to know what to supply.
+
+    python src/train.py --model lgbm --encoding int --weather_file data/weather_oslo.parquet --out_dir models/lgbm_int_wx
 """
 
 from __future__ import annotations
@@ -40,6 +50,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--val_start", default=None, help="YYYY-MM-DD start of the validation window")
     ap.add_argument("--val_days", type=int, default=30, help="If no --val_start, last N days")
     ap.add_argument("--alpha", default="auto", help="Ridge alpha, or 'auto' for RidgeCV")
+    ap.add_argument(
+        "--weather_file",
+        default=None,
+        help="Hourly weather parquet (e.g. data/weather_oslo.parquet). Adds weather at the "
+        "target hour t+h as features, using OBSERVED values (upper bound on forecast value).",
+    )
+    ap.add_argument(
+        "--weather_cols",
+        nargs="+",
+        default=["temperature_C", "wind_speed_ms", "precipitation_mm"],
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--no_embargo",
@@ -83,6 +104,14 @@ def main() -> None:
     df = df.sort_index()
 
     history = df[F.history_columns()]
+    weather = None
+    if args.weather_file:
+        weather = pd.read_parquet(repo_path(args.weather_file))
+        weather.index = (
+            weather.index.tz_localize(TZ) if weather.index.tz is None else weather.index.tz_convert(TZ)
+        )
+        weather = weather[~weather.index.duplicated()].sort_index()[args.weather_cols]
+        print(f"Weather features (observed, at t+h): {list(weather.columns)}")
     if not args.keep_warmup:
         history = history.iloc[F.MAX_HISTORY_HOURS :]
         df = df.iloc[F.MAX_HISTORY_HOURS :]
@@ -97,7 +126,7 @@ def main() -> None:
 
     clear_stale_models(out_dir, horizons)
 
-    print(f"Model: {args.model}   encoding: {encoding}   features: {len(F.feature_columns(encoding))}")
+    print(f"Model: {args.model}   encoding: {encoding}   features: {len(F.feature_columns(encoding)) + (len(weather.columns) if weather is not None else 0)}")
     print(f"Rows: {len(df):,}   span {df.index[0]} .. {df.index[-1]}")
     print(f"Validation starts: {val_start}   embargo: {'h hours' if embargo else 'DISABLED'}")
 
@@ -108,7 +137,7 @@ def main() -> None:
         target_col = F.target_column(horizon)
         y_all = df[target_col]
         labelled = y_all.notna()
-        X_all = F.assemble(history, df.index[labelled], horizon, encoding)
+        X_all = F.assemble(history, df.index[labelled], horizon, encoding, weather=weather)
         y_all = y_all[labelled]
 
         train_end = val_start - pd.Timedelta(hours=horizon) if embargo else val_start
@@ -119,7 +148,10 @@ def main() -> None:
         y_train = y_all[train_mask].to_numpy(dtype=float)
         y_val = y_all[val_mask].to_numpy(dtype=float)
 
-        estimator = M.build_estimator(args.model, encoding, alpha=args.alpha, seed=args.seed)
+        estimator = M.build_estimator(
+            args.model, encoding, alpha=args.alpha, seed=args.seed,
+            extra_cols=[c for c in X_all.columns if c.endswith("_target")],
+        )
         fit_info = M.fit_estimator(args.model, estimator, X_train, y_train)
 
         y_train_pred = estimator.predict(X_train)
@@ -143,7 +175,7 @@ def main() -> None:
             "estimator": estimator,
             "model": args.model,
             "encoding": encoding,
-            "features": F.feature_columns(encoding),
+            "features": list(X_all.columns),
             "categorical_features": F.categorical_columns(encoding),
             "horizon": horizon,
             "target": target_col,
@@ -202,6 +234,8 @@ def main() -> None:
         "encoding": encoding,
         "horizons": [int(r["horizon_hours"]) for r in results],
         "feature_file": str(feature_path),
+        "weather_file": args.weather_file,
+        "weather_cols": list(weather.columns) if weather is not None else [],
         "feature_definition": F.feature_definition(encoding),
         "val_start": str(val_start),
         "embargo": embargo,

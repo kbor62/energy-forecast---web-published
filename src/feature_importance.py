@@ -3,7 +3,7 @@
 A feature (or a group of related features) is shuffled and the increase in MAE
 is recorded, averaged over several repeats.
 
-    python src/feature_importance.py --model_dir models/lgbm_int models/ridge_ohe_both models/rf_trig
+    python src/feature_importance.py --model_dir models/lgbm_int models/ridge_ohe_both
 """
 
 from __future__ import annotations

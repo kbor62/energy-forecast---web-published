@@ -1,8 +1,10 @@
 """Download ENTSO-E day-ahead prices to CSV and Parquet, one year per request.
 
 Requires ENTSOE_TOKEN in a .env file in the repository root (see .env.example).
+Available zones: NO_1, NO_2, NO_3, NO_4, NO_5, and others (see ZONES_HINT).
 
     python src/fetch_prices.py --zone NO_1 --start 2020-01-01 --end 2026-09-23
+    python src/fetch_prices.py --zone NO_1 --start 2020-01-01  # Fetch up to today
 """
 
 from __future__ import annotations
