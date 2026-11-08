@@ -114,7 +114,7 @@ def fit_estimator(
     X_fit, y_fit = X.iloc[:n_fit], y[:n_fit]
     X_stop, y_stop = X.iloc[n_fit:], y[n_fit:]
     estimator.fit(
-        X_fit, y_fit, eval_set=[(X_stop, y_stop)], eval_metric="l1",
+        X_fit, y_fit, eval_X=X_stop, eval_y=y_stop, eval_metric="l1",
         callbacks=[early_stopping(100, verbose=False), log_evaluation(0)],
     )
     info["n_early_stopping_rows"] = int(n_val)
