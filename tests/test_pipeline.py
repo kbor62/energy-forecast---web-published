@@ -504,6 +504,22 @@ def test_exog_incremental_start_and_merge():
     assert m.loc["2026-11-10 12:00", "wind_DE_LU_MW"] == 1.0                         # other columns kept
 
 
+def test_incremental_plan_and_merge():
+    import incremental as INC
+
+    tz = "Europe/Oslo"
+    start = pd.Timestamp("2020-01-01", tz=tz)
+    first, last = pd.Timestamp("2020-01-01", tz=tz), pd.Timestamp("2026-11-10 23:00", tz=tz)
+    assert INC.plan_start(None, None, start) == start
+    assert INC.plan_start(first, last, start, 3) == pd.Timestamp("2026-11-07", tz=tz)
+    assert INC.plan_start(pd.Timestamp("2024-01-01", tz=tz), last, start) == start   # backfill
+    assert INC.plan_start(first, last, start, 100000) == start                       # never before start
+    old = pd.DataFrame({"a": [1.0, 2.0, 3.0]}, index=pd.date_range("2026-11-01", periods=3, freq="D", tz=tz))
+    new = pd.DataFrame({"a": [9.0, 8.0]}, index=pd.date_range("2026-11-03", periods=2, freq="D", tz=tz))
+    m = INC.merge_new(old, new)
+    assert list(m["a"]) == [1.0, 2.0, 9.0, 8.0]
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

@@ -30,6 +30,15 @@ Arguments:
     --end        End date in YYYY-MM-DD format (default: now)
     --out        Output Parquet file path (default: data/weather_oslo.parquet)
     --client_id  MET Frost API client ID (from environment or .env)
+    --overlap_days  Incremental update: re-fetch this many days before the last stored
+                 value (default 3)
+    --full       Ignore an existing output file and fetch the whole history
+
+Incremental update:
+    If --out already exists, only the tail is fetched (last stored hour minus
+    --overlap_days) and merged into it, new values overriding old ones. The full
+    history is fetched when the file is missing, when the stored data starts later than
+    --start, or with --full.
 
 Requirements:
     pip install pandas requests python-dotenv
@@ -71,6 +80,8 @@ from datetime import datetime
 
 import pandas as pd
 from dotenv import load_dotenv
+
+from incremental import merge_new, plan_start
 
 
 API_BASE = "https://frost.met.no/observations/v0.jsonld"
@@ -175,6 +186,8 @@ def main():
     ap.add_argument("--start", default="2020-01-01", help="Start date YYYY-MM-DD")
     ap.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today)")
     ap.add_argument("--out", default="data/weather_oslo.parquet", help="Output Parquet path")
+    ap.add_argument("--overlap_days", type=int, default=3, help="Incremental update: re-fetch this many days before the last stored value")
+    ap.add_argument("--full", action="store_true", help="Ignore an existing file and fetch the whole history")
     ap.add_argument("--client_id", default=None, help="Frost API client ID (default: from FROST_CLIENT_ID env)")
     args = ap.parse_args()
 
@@ -187,8 +200,24 @@ def main():
 
     end_date = args.end if args.end else datetime.now().strftime("%Y-%m-%d")
 
-    print(f"Fetching weather data {args.start} -> {end_date} for station {args.station} (yearly chunks)...")
-    df = fetch_frost_data(args.station, args.start, end_date, client_id)
+    old = None
+    fetch_start = args.start
+    out_path = Path(args.out)
+    if out_path.exists() and not args.full:
+        old = pd.read_parquet(out_path)
+        start_ts = pd.Timestamp(args.start, tz=TZ)
+        inc = plan_start(old.index.min(), old.index.max(), start_ts, args.overlap_days)
+        if inc > start_ts:
+            fetch_start = min(inc.strftime("%Y-%m-%d"), (pd.Timestamp(end_date) - pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+            print(f"Existing {out_path.name}: {len(old):,} rows, last {old.index.max()}")
+        else:
+            old = None  # stored data starts too late -> full fetch
+
+    mode = "Updating" if old is not None else "Fetching"
+    print(f"{mode} weather data {fetch_start} -> {end_date} for station {args.station} (yearly chunks)...")
+    df = fetch_frost_data(args.station, fetch_start, end_date, client_id)
+    if old is not None:
+        df = merge_new(old, df).asfreq("h")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(args.out, index=True)

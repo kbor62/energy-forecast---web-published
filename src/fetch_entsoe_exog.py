@@ -35,6 +35,7 @@ import pandas as pd
 from config import BRUSSELS_TZ, ENTSOE_TOKEN, TZ, repo_path
 from exog import normalise_wind_solar
 from fetch_prices import build_chunks
+from incremental import merge_new, plan_start
 
 DEFAULT_WIND_ZONES = ["DE_LU", "DK_1", "DK_2", "SE_3"]
 DEFAULT_PRICE_ZONES = ["NO_2", "SE_3", "DK_1", "DE_LU"]
@@ -89,18 +90,11 @@ def zone_start(existing: pd.DataFrame | None, kind: str, zone: str, start: pd.Ti
     if any(c not in existing.columns or existing[c].first_valid_index() is None for c in cols):
         return start
     first = max(existing[c].first_valid_index() for c in cols)
-    if first > start.tz_convert(first.tz) + pd.Timedelta(days=backfill_tolerance_days):
-        return start  # stored history begins later than requested -> backfill
     last = min(existing[c].last_valid_index() for c in cols)
-    inc = (last - pd.Timedelta(days=overlap_days)).tz_convert(start.tz).normalize()
-    return max(inc, start)
+    return plan_start(first, last, start, overlap_days, backfill_tolerance_days)
 
 
-def merge_exog(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
-    """New values override old ones; old rows/columns not in `new` are kept."""
-    if old is None:
-        return new
-    return new.combine_first(old).sort_index()
+merge_exog = merge_new
 
 
 def fetch_all(client, wind_zones, price_zones, chunks, retries: int = 4, sleep: float = 0.5) -> pd.DataFrame:

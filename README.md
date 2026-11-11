@@ -278,7 +278,7 @@ Training settings:
 
   python tests/test_pipeline.py        (or: pytest tests/)
 
-  Expected: 27/27 passed (13 pipeline tests, 6 weather, 2 origin-time and 6 ENTSO-E exog tests; sections 13.8, 15 and 16.7).
+  Expected: 28/28 passed (13 pipeline tests, 6 weather, 2 origin-time, 6 ENTSO-E exog and 1 incremental-update test; sections 13.8, 15, 16.7 and 17).
 
 -------------------------------------------------------------------------------
 10. OUTPUTS AND THE STEP THAT PRODUCES THEM
@@ -398,7 +398,8 @@ in section 11 are reproduced exactly as before. Weather is an optional add-on.
   packages: requests, python-dateutil (listed in requirements.txt).
 
 13.4 Step by step
-  a) Observed weather history (re-run to extend it; fetches 2020 onwards):
+  a) Observed weather history (first run fetches 2020 onwards; re-runs only fetch the
+     tail and merge it, see section 17):
        python src/fetch_weather.py --out data/weather_oslo.parquet
      Keep it as new as the price file; rows after its end train with NaN weather.
   b) Forecast snapshot (see 13.5 for scheduling):
@@ -492,7 +493,7 @@ in section 11 are reproduced exactly as before. Weather is an optional add-on.
   forecast.py refuses to run if the built feature list differs from the
     model's saved "features" (model/manifest mismatch).
 
-13.8 Tests  (python tests/test_pipeline.py  or  pytest tests/ ; expected 27/27)
+13.8 Tests  (python tests/test_pipeline.py  or  pytest tests/ ; expected 28/28)
   The 13 tests of section 9, two origin-time tests (section 15), six ENTSO-E exog
   tests (section 16.7) and six weather tests: target-hour alignment of the
   weather columns, price-only features unchanged without weather, ridge keeps the
@@ -720,3 +721,29 @@ the fetch (16.3) and the backtests (16.4) yourself.
   leaves the features unchanged), column order of assemble(), and the fetch logic
   with a fake client (failing zones skipped, error when nothing arrives), and the
   incremental update (per-zone start date, backfill, merge).
+
+
+-------------------------------------------------------------------------------
+17. INCREMENTAL UPDATES OF DOWNLOADED HISTORY
+-------------------------------------------------------------------------------
+
+The three history downloads share one behaviour (src\incremental.py):
+
+  src\fetch_prices.py        NO_1 day-ahead prices        -> data\entsoe_<zone>_..._now.parquet/.csv
+  src\fetch_weather.py       observed Oslo weather        -> data\weather_oslo.parquet
+  src\fetch_entsoe_exog.py   ENTSO-E wind/solar/prices    -> data\entsoe_exog.parquet (per zone)
+
+  * Output file missing: the full history from --start is fetched (slow, once).
+  * Output file present: only the tail is fetched, from the last stored timestamp
+    minus --overlap_days (default 3), and merged into the file. Values in the overlap
+    are replaced by the new ones (late-published or revised data); older rows are kept.
+  * Full re-fetch happens automatically when the stored data starts more than 7 days
+    after --start (backfill), and always with --full. For the exog file this is
+    decided per zone, so adding a new zone only downloads that zone in full.
+  * run_pipeline.py calls the scripts without --full, so a normal pipeline run is
+    incremental. Use --full if you suspect gaps or have changed zone/station/start.
+    Changing the weather station or price zone with an existing --out file requires
+    --full (or a different --out), otherwise old and new data would be mixed.
+
+Not incremental: fetch_weather_forecast.py. It takes a snapshot of the current MET
+forecast each run (there is no history to fetch); the archive grows by one file per run.

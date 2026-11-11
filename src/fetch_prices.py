@@ -5,6 +5,9 @@ Available zones: NO_1, NO_2, NO_3, NO_4, NO_5, and others (see ZONES_HINT).
 
     python src/fetch_prices.py --zone NO_1 --start 2020-01-01 --end 2026-09-23
     python src/fetch_prices.py --zone NO_1 --start 2020-01-01  # Fetch up to today
+
+If the output Parquet already exists, only the tail is fetched (last stored hour minus
+--overlap_days) and merged into it; --full re-fetches everything. See incremental.py.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import time
 import pandas as pd
 
 from config import BRUSSELS_TZ, ENTSOE_TOKEN, TZ, repo_path
+from incremental import plan_start
 
 ZONES_HINT = "NO_1 Oslo, NO_2 Kristiansand, NO_3 Trondheim, NO_4 Tromso, NO_5 Bergen"
 
@@ -31,6 +35,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--chunk", default="1YE", help='Chunk size, e.g. "1YE" or "6ME"')
     p.add_argument("--sleep", type=float, default=0.5, help="Seconds between requests")
     p.add_argument("--retries", type=int, default=4, help="Attempts per chunk")
+    p.add_argument("--overlap_days", type=int, default=3, help="Incremental update: re-fetch this many days before the last stored value")
+    p.add_argument("--full", action="store_true", help="Ignore an existing file and fetch the whole history")
     return p.parse_args()
 
 
@@ -71,8 +77,19 @@ def main() -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     client = EntsoePandasClient(api_key=token)
-    chunks = build_chunks(start, end, freq=args.chunk)
-    print(f"Fetching {zone} in {len(chunks)} chunk(s): {start.date()} -> {end.date()}")
+    old = None
+    if parquet_path.exists() and not args.full:
+        old = pd.read_parquet(parquet_path)
+        old["timestamp"] = pd.to_datetime(old["timestamp"], utc=True).dt.tz_convert(TZ)
+        fetch_start = plan_start(old["timestamp"].min(), old["timestamp"].max(), start, args.overlap_days)
+        print(f"Existing {parquet_path.name}: {len(old):,} rows, last {old['timestamp'].max()}")
+    else:
+        fetch_start = start
+    if fetch_start >= end:
+        fetch_start = end - pd.Timedelta(days=1)
+    chunks = build_chunks(fetch_start, end, freq=args.chunk)
+    mode = "Updating" if fetch_start > start else "Fetching"
+    print(f"{mode} {zone} in {len(chunks)} chunk(s): {fetch_start.date()} -> {end.date()}")
 
     parts: list[pd.Series] = []
     for i, (a, b) in enumerate(chunks, 1):
@@ -97,6 +114,9 @@ def main() -> None:
 
     df = series.reset_index()
     df.columns = ["timestamp", "price_EUR_per_MWh"]
+    if old is not None:  # new values override the overlap; older rows are kept
+        keep = old[old["timestamp"] < df["timestamp"].min()][["timestamp", "price_EUR_per_MWh"]]
+        df = pd.concat([keep, df], ignore_index=True)
     df["price_EUR_per_kWh"] = df["price_EUR_per_MWh"] / 1000.0
     df = df.sort_values("timestamp").reset_index(drop=True)
 
