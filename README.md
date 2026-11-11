@@ -278,7 +278,7 @@ Training settings:
 
   python tests/test_pipeline.py        (or: pytest tests/)
 
-  Expected: 26/26 passed (13 pipeline tests, 6 weather, 2 origin-time and 5 ENTSO-E exog tests; sections 13.8, 15 and 16.7).
+  Expected: 27/27 passed (13 pipeline tests, 6 weather, 2 origin-time and 6 ENTSO-E exog tests; sections 13.8, 15 and 16.7).
 
 -------------------------------------------------------------------------------
 10. OUTPUTS AND THE STEP THAT PRODUCES THEM
@@ -492,8 +492,8 @@ in section 11 are reproduced exactly as before. Weather is an optional add-on.
   forecast.py refuses to run if the built feature list differs from the
     model's saved "features" (model/manifest mismatch).
 
-13.8 Tests  (python tests/test_pipeline.py  or  pytest tests/ ; expected 26/26)
-  The 13 tests of section 9, two origin-time tests (section 15), five ENTSO-E exog
+13.8 Tests  (python tests/test_pipeline.py  or  pytest tests/ ; expected 27/27)
+  The 13 tests of section 9, two origin-time tests (section 15), six ENTSO-E exog
   tests (section 16.7) and six weather tests: target-hour alignment of the
   weather columns, price-only features unchanged without weather, ridge keeps the
   weather columns, snapshot choice never looks ahead, snapshot-only mode has no
@@ -672,6 +672,12 @@ the fetch (16.3) and the backtests (16.4) yourself.
 16.3 Fetch
   python src/fetch_entsoe_exog.py
   python src/fetch_entsoe_exog.py --wind_zones DE_LU DK_1 --price_zones NO_2 SE_3 --start 2023-01-01
+  First run fetches the full history (slow). Later runs update incrementally: each
+  zone is fetched from its last stored value minus --overlap_days (default 3, covers
+  late/revised forecasts) and merged into the existing file. A zone with no stored
+  data, or stored data starting later than --start, is fetched in full; --full
+  forces a complete re-fetch (use it after changing --start to an earlier date
+  for all zones or if the file looks wrong).
   Needs ENTSOE_TOKEN in .env. Output: data\entsoe_exog.parquet (+ _meta.json with
   rows and first/last time per column). Fetches until now + 2 days, so tomorrow's
   forecasts are included once published. A zone that fails is skipped with a
@@ -712,4 +718,5 @@ the fetch (16.3) and the backtests (16.4) yourself.
   Normalisation of entsoe-py wind/solar frames (flat and MultiIndex), the
   availability rule, no look-ahead (perturbing unpublished values or later prices
   leaves the features unchanged), column order of assemble(), and the fetch logic
-  with a fake client (failing zones skipped, error when nothing arrives).
+  with a fake client (failing zones skipped, error when nothing arrives), and the
+  incremental update (per-zone start date, backfill, merge).

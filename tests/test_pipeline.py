@@ -482,6 +482,28 @@ def test_exog_fetch_skips_failing_zones_and_fails_when_nothing_arrives():
     raise AssertionError("expected RuntimeError when no zone returns data")
 
 
+def test_exog_incremental_start_and_merge():
+    import fetch_entsoe_exog as FX
+
+    tz = "Europe/Oslo"
+    start = pd.Timestamp("2020-01-01", tz="Europe/Brussels")
+    idx = pd.date_range("2020-01-01", "2026-11-10 23:00", freq="h", tz=tz)
+    old = pd.DataFrame({"wind_DE_LU_MW": 1.0, "solar_DE_LU_MW": 1.0, "price_NO_2_EUR_MWh": 5.0}, index=idx)
+    assert FX.zone_start(None, "price", "NO_2", start) == start
+    assert FX.zone_start(old, "price", "SE_3", start) == start                       # new zone -> full
+    inc = FX.zone_start(old, "wind_solar", "DE_LU", start, overlap_days=3)
+    assert inc == pd.Timestamp("2026-11-07", tz="Europe/Brussels")                   # last - 3 days
+    late = old.loc["2024-01-01":]
+    assert FX.zone_start(late, "price", "NO_2", start) == start                      # backfill needed
+    new = pd.DataFrame({"price_NO_2_EUR_MWh": 9.0},
+                       index=pd.date_range("2026-11-10", "2026-11-12 23:00", freq="h", tz=tz))
+    m = FX.merge_exog(old, new)
+    assert m.loc["2026-11-10 12:00", "price_NO_2_EUR_MWh"] == 9.0                     # overlap: new wins
+    assert m.loc["2026-11-12 12:00", "price_NO_2_EUR_MWh"] == 9.0                     # extended
+    assert m.loc["2026-11-05 12:00", "price_NO_2_EUR_MWh"] == 5.0                    # old kept
+    assert m.loc["2026-11-10 12:00", "wind_DE_LU_MW"] == 1.0                         # other columns kept
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

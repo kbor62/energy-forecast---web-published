@@ -16,6 +16,12 @@ areas, e.g. DE_LU, DK_1, DK_2, SE_3, SE_4, NO_2, NL, GB.
 A zone that fails (no data, API error after retries) is skipped with a warning; the
 run fails only if nothing at all could be fetched. The fetched end date defaults to
 now + 2 days, so tomorrow's forecasts are included once published.
+
+Incremental update: if --out already exists, each zone is fetched only from its last
+stored value minus --overlap_days (default 3; re-fetches revised/late-published
+forecasts) and merged into the file, new values overriding old ones. A zone with no
+stored columns, or whose stored data starts well after --start, is fetched in full.
+--full ignores the existing file and re-fetches everything.
 """
 
 from __future__ import annotations
@@ -70,12 +76,41 @@ def fetch_zone(client, kind: str, zone: str, chunks, retries: int = 4, sleep: fl
     return df[~df.index.duplicated(keep="last")]
 
 
+def zone_columns(kind: str, zone: str) -> list[str]:
+    return [f"wind_{zone}_MW", f"solar_{zone}_MW"] if kind == "wind_solar" else [f"price_{zone}_EUR_MWh"]
+
+
+def zone_start(existing: pd.DataFrame | None, kind: str, zone: str, start: pd.Timestamp,
+               overlap_days: int = 3, backfill_tolerance_days: int = 7) -> pd.Timestamp:
+    """Where to start fetching one zone: full history, or last stored value minus overlap."""
+    if existing is None:
+        return start
+    cols = zone_columns(kind, zone)
+    if any(c not in existing.columns or existing[c].first_valid_index() is None for c in cols):
+        return start
+    first = max(existing[c].first_valid_index() for c in cols)
+    if first > start.tz_convert(first.tz) + pd.Timedelta(days=backfill_tolerance_days):
+        return start  # stored history begins later than requested -> backfill
+    last = min(existing[c].last_valid_index() for c in cols)
+    inc = (last - pd.Timedelta(days=overlap_days)).tz_convert(start.tz).normalize()
+    return max(inc, start)
+
+
+def merge_exog(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
+    """New values override old ones; old rows/columns not in `new` are kept."""
+    if old is None:
+        return new
+    return new.combine_first(old).sort_index()
+
+
 def fetch_all(client, wind_zones, price_zones, chunks, retries: int = 4, sleep: float = 0.5) -> pd.DataFrame:
+    """`chunks` is a list of (start, end), or a callable (kind, zone) -> list of (start, end)."""
     parts = []
     for kind, zones in (("wind_solar", wind_zones), ("price", price_zones)):
         for zone in zones:
             print(f"{kind} {zone} ...")
-            df = fetch_zone(client, kind, zone, chunks, retries, sleep)
+            zc = chunks(kind, zone) if callable(chunks) else chunks
+            df = fetch_zone(client, kind, zone, zc, retries, sleep)
             if df is None:
                 print(f"  WARNING: no data for {kind} {zone}; skipped")
                 continue
@@ -96,6 +131,8 @@ def main() -> None:
     ap.add_argument("--chunk", default="6ME")
     ap.add_argument("--sleep", type=float, default=0.5)
     ap.add_argument("--retries", type=int, default=4)
+    ap.add_argument("--overlap_days", type=int, default=3, help="Incremental update: re-fetch this many days before the last stored value")
+    ap.add_argument("--full", action="store_true", help="Ignore an existing file and fetch the whole history")
     args = ap.parse_args()
 
     token = ENTSOE_TOKEN.strip()
@@ -107,13 +144,24 @@ def main() -> None:
     start = pd.Timestamp(args.start, tz=BRUSSELS_TZ)
     end = (pd.Timestamp.now(tz=BRUSSELS_TZ) + pd.Timedelta(days=2)).normalize() if args.end is None \
         else pd.Timestamp(args.end, tz=BRUSSELS_TZ)
-    chunks = build_chunks(start, end, freq=args.chunk)
-    print(f"Fetching {len(chunks)} chunk(s) per zone: {start.date()} -> {end.date()}")
-
-    df = fetch_all(EntsoePandasClient(api_key=token), args.wind_zones, args.price_zones, chunks,
-                   args.retries, args.sleep)
-    df.index.name = "timestamp"
     out = repo_path(args.out)
+    existing = None
+    if out.exists() and not args.full:
+        existing = pd.read_parquet(out)
+        print(f"Updating {out} ({len(existing):,} rows, last {existing.index.max()})")
+    else:
+        print(f"Full fetch {start.date()} -> {end.date()}")
+
+    def chunks_for(kind: str, zone: str):
+        zs = zone_start(existing, kind, zone, start, args.overlap_days)
+        if existing is not None:
+            print(f"  from {zs.date()}" + ("" if zs > start else " (full)"))
+        return build_chunks(zs, end, freq=args.chunk)
+
+    new = fetch_all(EntsoePandasClient(api_key=token), args.wind_zones, args.price_zones, chunks_for,
+                    args.retries, args.sleep)
+    df = merge_exog(existing, new)
+    df.index.name = "timestamp"
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out)
 
