@@ -4,17 +4,15 @@ The last --val_days days are held out for validation. Training for horizon h
 stops h hours before the validation window (the embargo), so that no training
 label falls inside it.
 
-    python src/train.py --inp data/features_price_only.parquet --model lgbm --encoding int --horizon 48 --val_days 30
-    python src/train.py --model ridge --encoding trig
-    python src/train.py --model ridge_ohe --encoding both
+    python src/train.py --inp data/features_price_only.parquet --horizon 48 --val_days 30
 
 Weather (optional): --weather_file adds the weather at the target hour t+h
 (<col>_target) as features, using OBSERVED values, so validation scores are an
 upper bound on the value of a weather forecast. Use a separate --out_dir
-(e.g. models/lgbm_int_wx) to keep the price-only models. The manifest records
+(e.g. models/lgbm_wx) to keep the price-only models. The manifest records
 weather_file and weather_cols; forecast.py reads them to know what to supply.
 
-    python src/train.py --model lgbm --encoding int --weather_file data/weather_oslo.parquet --out_dir models/lgbm_int_wx
+    python src/train.py --weather_file data/weather_oslo.parquet --out_dir models/lgbm_wx
 """
 
 from __future__ import annotations
@@ -29,6 +27,8 @@ from joblib import dump
 
 import features as F
 import exog as X_
+import nwp as N_
+import targets as T_
 import models as M
 from config import TZ, repo_path
 from metrics import summarize
@@ -39,18 +39,10 @@ DEFAULT_INPUT = "data/features_price_only.parquet"
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Train direct multi-step price models")
     ap.add_argument("--inp", default=DEFAULT_INPUT, help="Feature parquet written by build_features.py")
-    ap.add_argument("--out_dir", default=None, help="Model output dir (default: models/<model>_<encoding>)")
-    ap.add_argument("--model", choices=M.MODELS, default="lgbm")
-    ap.add_argument(
-        "--encoding",
-        choices=F.ENCODINGS,
-        default=None,
-        help="Calendar encoding (default depends on the model)",
-    )
+    ap.add_argument("--out_dir", default=f"models/{M.MODEL_NAME}", help="Model output dir (default: models/lgbm)")
     ap.add_argument("--horizon", type=int, default=48, help="Train horizons 1..N")
     ap.add_argument("--val_start", default=None, help="YYYY-MM-DD start of the validation window")
     ap.add_argument("--val_days", type=int, default=30, help="If no --val_start, last N days")
-    ap.add_argument("--alpha", default="auto", help="Ridge alpha, or 'auto' for RidgeCV")
     ap.add_argument(
         "--weather_file",
         default=None,
@@ -70,6 +62,8 @@ def parse_args() -> argparse.Namespace:
         "See exog.py.",
     )
     ap.add_argument("--exog_cols", nargs="+", default=None, help="Exog columns to use (default: all in the file)")
+    N_.add_args(ap)
+    T_.add_args(ap)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--no_embargo",
@@ -101,8 +95,7 @@ def clear_stale_models(out_dir: Path, horizons: list[int]) -> None:
 
 def main() -> None:
     args = parse_args()
-    encoding = args.encoding or M.DEFAULT_ENCODING[args.model]
-    out_dir = repo_path(args.out_dir or f"models/{args.model}_{encoding}")
+    out_dir = repo_path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     feature_path = repo_path(args.inp)
@@ -113,6 +106,7 @@ def main() -> None:
     df = df.sort_index()
 
     history = df[F.history_columns()]
+    price_series = df["lag0h"]  # lag0h is the price at each hour; used for target anchors
     weather = None
     if args.weather_file:
         weather = pd.read_parquet(repo_path(args.weather_file))
@@ -132,6 +126,12 @@ def main() -> None:
             exog = exog[args.exog_cols]
         print(f"Exog features: {list(exog.columns)}")
 
+    nwp = None
+    if args.nwp_file:
+        nwp = N_.load_nwp(args.nwp_file, args.nwp_cols)
+        print(f"NWP features: {N_.bases(nwp.columns)}")
+    print(f"Decision lag: {args.decision_lag_hours} h before the origin")
+
     if args.val_start:
         val_start = pd.Timestamp(args.val_start, tz=TZ)
     else:
@@ -142,7 +142,7 @@ def main() -> None:
 
     clear_stale_models(out_dir, horizons)
 
-    print(f"Model: {args.model}   encoding: {encoding}   features: {len(F.feature_columns(encoding)) + (len(weather.columns) if weather is not None else 0) + (len(X_.feature_names(exog.columns)) if exog is not None else 0)}")
+    print(f"Model: {M.MODEL_NAME}   features: {len(F.feature_columns()) + (len(weather.columns) if weather is not None else 0) + (len(X_.feature_names(exog.columns)) if exog is not None else 0) + (len(N_.bases(nwp.columns)) if nwp is not None else 0)}")
     print(f"Rows: {len(df):,}   span {df.index[0]} .. {df.index[-1]}")
     print(f"Validation starts: {val_start}   embargo: {'h hours' if embargo else 'DISABLED'}")
 
@@ -152,26 +152,30 @@ def main() -> None:
     for horizon in horizons:
         target_col = F.target_column(horizon)
         y_all = df[target_col]
-        labelled = y_all.notna()
-        X_all = F.assemble(history, df.index[labelled], horizon, encoding, weather=weather, exog=exog)
+        offset_all, scale_all = T_.anchor(price_series, df.index, horizon, args.target_mode)
+        labelled = y_all.notna() & np.isfinite(offset_all) & np.isfinite(scale_all)
+        X_all = F.assemble(history, df.index[labelled], horizon, weather=weather, exog=exog, nwp=nwp,
+                           decision_lag_h=args.decision_lag_hours)
+        offset_all, scale_all = offset_all[labelled.to_numpy()], scale_all[labelled.to_numpy()]
+        X_all = T_.add_features(X_all, offset_all, scale_all, args.target_mode)
         y_all = y_all[labelled]
 
         train_end = val_start - pd.Timedelta(hours=horizon) if embargo else val_start
         train_mask, val_mask = F.train_val_masks(X_all.index, val_start, horizon, embargo)
 
-        X_train = M.prepare_X(args.model, X_all[train_mask], encoding)
-        X_val = M.prepare_X(args.model, X_all[val_mask], encoding)
+        X_train = M.prepare_X(X_all[train_mask])
+        X_val = M.prepare_X(X_all[val_mask])
         y_train = y_all[train_mask].to_numpy(dtype=float)
         y_val = y_all[val_mask].to_numpy(dtype=float)
+        off_tr, sc_tr = offset_all[train_mask], scale_all[train_mask]
+        off_va, sc_va = offset_all[val_mask], scale_all[val_mask]
 
-        estimator = M.build_estimator(
-            args.model, encoding, alpha=args.alpha, seed=args.seed,
-            extra_cols=[c for c in X_all.columns if c not in F.feature_columns(encoding)],
-        )
-        fit_info = M.fit_estimator(args.model, estimator, X_train, y_train)
+        estimator = M.build_estimator(seed=args.seed)
+        fit_info = M.fit_estimator(estimator, X_train, T_.to_target(y_train, off_tr, sc_tr))
 
-        y_train_pred = estimator.predict(X_train)
-        y_val_pred = estimator.predict(X_val)
+        # Metrics and intervals on the price scale, whatever the target mode.
+        y_train_pred = T_.to_price(estimator.predict(X_train), off_tr, sc_tr)
+        y_val_pred = T_.to_price(estimator.predict(X_val), off_va, sc_va)
 
         train_metrics = summarize(y_train, y_train_pred)
         val_metrics = summarize(y_val, y_val_pred)
@@ -189,12 +193,12 @@ def main() -> None:
 
         payload = {
             "estimator": estimator,
-            "model": args.model,
-            "encoding": encoding,
+            "model": M.MODEL_NAME,
             "features": list(X_all.columns),
-            "categorical_features": F.categorical_columns(encoding),
+            "categorical_features": F.categorical_columns(),
             "horizon": horizon,
             "target": target_col,
+            "target_mode": args.target_mode,
         }
         model_path = out_dir / f"price_model_t{horizon}h.joblib"
         dump(payload, model_path)
@@ -202,8 +206,7 @@ def main() -> None:
         meta = {
             "horizon_hours": horizon,
             "target": target_col,
-            "model": args.model,
-            "encoding": encoding,
+            "model": M.MODEL_NAME,
             "train_samples": int(len(X_train)),
             "val_samples": int(len(X_val)),
             "val_start": str(val_start),
@@ -246,15 +249,18 @@ def main() -> None:
 
     manifest = {
         "trained_at": pd.Timestamp.now(tz=TZ).isoformat(),
-        "model": args.model,
-        "encoding": encoding,
+        "model": M.MODEL_NAME,
         "horizons": [int(r["horizon_hours"]) for r in results],
         "feature_file": str(feature_path),
         "weather_file": args.weather_file,
         "weather_cols": list(weather.columns) if weather is not None else [],
         "exog_file": args.exog_file,
         "exog_cols": list(exog.columns) if exog is not None else [],
-        "feature_definition": F.feature_definition(encoding),
+        "nwp_file": args.nwp_file,
+        "nwp_cols": N_.bases(nwp.columns) if nwp is not None else [],
+        "decision_lag_hours": args.decision_lag_hours,
+        "target_mode": args.target_mode,
+        "feature_definition": F.feature_definition(),
         "val_start": str(val_start),
         "embargo": embargo,
         "seed": args.seed,

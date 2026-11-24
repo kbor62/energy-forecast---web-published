@@ -15,7 +15,13 @@ forecasts of neighbouring zones, neighbour prices; see exog.py): the file in the
 manifest, or --exog_file. Refresh it with fetch_entsoe_exog.py first. Forecast hours
 whose wind/solar forecast is not published at the decision time are passed as NaN.
 
-    python src/forecast.py --price data/entsoe_NO_1_2020-01-01_now.parquet --model_dir models/lgbm_int --horizon 48 --save_png
+Models trained with --nwp_file need the archived weather-model forecasts refreshed with
+fetch_openmeteo.py (the file in the manifest, or --nwp_file). The decision lag the model
+was trained for (manifest decision_lag_hours: 11 = before the auction, 33 = D+2/D+3 after
+the auction) decides which forecast run is used per hour; run the forecast accordingly
+(lag 33: after about 13:00, when tomorrow's prices are known).
+
+    python src/forecast.py --price data/entsoe_NO_1_2020-01-01_now.parquet --model_dir models/lgbm --horizon 48 --save_png
 """
 
 from __future__ import annotations
@@ -33,8 +39,11 @@ from joblib import load
 
 import features as F
 import exog as X_
+import nwp as N_
+import targets as T_
+import fx as FX_
 import models as M
-from config import EUR_TO_NOK, ROOT, TZ, repo_path
+from config import ROOT, TZ, repo_path
 from plotting import save_figure
 from price_io import load_price_series
 from weather_io import ARCHIVE_DIR, weather_for_forecast
@@ -63,7 +72,7 @@ def load_models(model_dir: Path, horizon: int) -> dict[int, dict]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Forecast the next N hours with a trained model set")
     ap.add_argument("--price", default=DEFAULT_PRICE, help="Raw price CSV/parquet")
-    ap.add_argument("--model_dir", default="models/lgbm_int", help="Directory of trained models")
+    ap.add_argument("--model_dir", default="models/lgbm", help="Directory of trained models")
     ap.add_argument("--out_csv", default=None)
     ap.add_argument("--out_json", default=None)
     ap.add_argument("--horizon", type=int, default=48)
@@ -76,6 +85,8 @@ def main() -> None:
         help="Use the latest snapshot issued at/before this time (default: now, or --origin if given)",
     )
     ap.add_argument("--exog_file", default=None, help="ENTSO-E exog parquet (default: the file the model was trained with)")
+    ap.add_argument("--nwp_file", default=None, help="Open-Meteo NWP parquet (default: the file the model was trained with)")
+    ap.add_argument("--fx_file", default=FX_.DEFAULT_FILE, help="EUR/NOK rates from fx.py (fixed rate if missing)")
     ap.add_argument("--save_png", action="store_true")
     ap.add_argument("--history_hours", type=int, default=72, help="History shown in the plot")
     args = ap.parse_args()
@@ -88,7 +99,6 @@ def main() -> None:
     price = load_price_series(repo_path(args.price), tz=TZ)
     manifest = load_manifest(model_dir)
     models = load_models(model_dir, args.horizon)
-    encoding = models[1]["payload"]["encoding"]
     model_name = models[1]["payload"]["model"]
 
     observed = price.dropna()
@@ -112,8 +122,20 @@ def main() -> None:
         n_exog = len(X_.feature_names(exog_cols))
         last = exog.dropna(how="all").index.max()
         print(f"Exog: {exog_path}   {len(exog_cols)} columns -> {n_exog} features   data until {last}")
-        if last < origin + pd.Timedelta(hours=1):
-            print("  WARNING: exog data ends at/before the origin; run fetch_entsoe_exog.py")
+        if last < origin:
+            print("  WARNING: exog data ends before the origin; run fetch_entsoe_exog.py")
+        elif int(manifest.get("decision_lag_hours", X_.DECISION_LAG_H)) <= X_.DECISION_LAG_H \
+                and last < origin + pd.Timedelta(hours=24):
+            print("  WARNING: tomorrow's wind/solar/load forecasts are missing; run fetch_entsoe_exog.py")
+
+    lag = int(manifest.get("decision_lag_hours", X_.DECISION_LAG_H))
+    nwp_cols = manifest.get("nwp_cols") or []
+    nwp = None
+    if nwp_cols:
+        nwp_path = args.nwp_file or manifest.get("nwp_file")
+        nwp = N_.load_nwp(nwp_path, nwp_cols)
+        print(f"NWP: {nwp_path}   {nwp_cols}   data until {nwp.dropna(how='all').index.max()}")
+    print(f"Decision lag: {lag} h (decision time for this origin: {origin - pd.Timedelta(hours=lag)})")
 
     # Weather-trained models need weather at origin+h: archived forecast where it
     # covers the hour, observations otherwise. Models without weather skip this.
@@ -139,23 +161,32 @@ def main() -> None:
         if weather_info["cells_missing"]:
             print("  WARNING: missing weather values are passed to the model as NaN")
     print(
-        f"Model: {model_name}   encoding: {encoding}   horizons: {len(models)}   "
+        f"Model: {model_name}   horizons: {len(models)}   "
         f"trained {manifest.get('trained_at', '?')[:16]}"
     )
     print(f"Forecast origin: {origin}  (price {float(price.loc[origin]):.4f} EUR/kWh)")
 
     rows = []
+    nwp_missing_hours: list[int] = []
     for h in sorted(models):
         payload = models[h]["payload"]
-        X = F.assemble(history, [origin], h, encoding, weather=weather, exog=exog)
+        X = F.assemble(history, [origin], h, weather=weather, exog=exog, nwp=nwp, decision_lag_h=lag)
+        mode = payload.get("target_mode", "level")
+        off, sc = T_.anchor(price, [origin], h, mode)
+        X = T_.add_features(X, off, sc, mode)
         if list(X.columns) != list(payload["features"]):
             raise RuntimeError(
                 f"t+{h}h: model expects {len(payload['features'])} features, built {X.shape[1]}. "
-                "Model/manifest mismatch (weather columns)?"
+                "Model/manifest mismatch (weather/exog/NWP columns), or a model trained with an older "
+                "feature set: retrain with train.py."
             )
+        if nwp is not None:
+            missing_nwp = [c for c in N_.feature_names(nwp_cols) if pd.isna(X[c].iloc[0])]
+            if missing_nwp:
+                nwp_missing_hours.append(h)
 
-        X = M.prepare_X(payload["model"], X, encoding)
-        pred = float(payload["estimator"].predict(X)[0])
+        X = M.prepare_X(X)
+        pred = float(T_.to_price(payload["estimator"].predict(X), off, sc)[0])
 
         pi80 = models[h]["intervals"]["pi_80"]
         rows.append(
@@ -168,9 +199,16 @@ def main() -> None:
             }
         )
 
+    if nwp_missing_hours:
+        print(f"  WARNING: NWP values missing for {len(nwp_missing_hours)} horizons (passed as NaN); "
+              "run fetch_openmeteo.py")
     forecast = pd.DataFrame(rows).set_index("timestamp").sort_index()
+    eur_nok, fx_source = FX_.rate_on(pd.Timestamp.now(tz=TZ), FX_.load_rates(args.fx_file))
+    print(f"EUR/NOK {eur_nok:.4f} ({fx_source})")
+    if fx_source.startswith("fixed"):
+        print("  WARNING: no recent Norges Bank rate; run python src/fx.py")
     for col in [c for c in forecast.columns if c.endswith("_EUR") or c.endswith("_EUR_per_kWh")]:
-        forecast[col.replace("EUR", "NOK")] = forecast[col] * EUR_TO_NOK
+        forecast[col.replace("EUR", "NOK")] = forecast[col] * eur_nok
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     forecast.to_csv(out_csv)
@@ -180,11 +218,13 @@ def main() -> None:
         "forecast_origin": origin.isoformat(),
         "origin_price_EUR_per_kWh": float(price.loc[origin]),
         "model": model_name,
-        "encoding": encoding,
+        "decision_lag_hours": lag,
+        "target_mode": manifest.get("target_mode", "level"),
         "model_dir": str(model_dir),
         "model_trained_at": manifest.get("trained_at"),
         "weather": weather_info,
-        "eur_nok": EUR_TO_NOK,
+        "eur_nok": eur_nok,
+        "eur_nok_source": fx_source,
         "interval_method": models[min(models)]["intervals"].get("method"),
         "horizons": [
             {
@@ -207,7 +247,7 @@ def main() -> None:
 
         plt.figure(figsize=(14, 7))
         plt.plot(
-            hist.index, hist.to_numpy() * EUR_TO_NOK,
+            hist.index, hist.to_numpy() * eur_nok,
             label=f"Observed (last {args.history_hours}h)", color="steelblue", linewidth=1.6,
         )
         bridge = pd.concat(
@@ -215,8 +255,8 @@ def main() -> None:
              forecast["predicted_EUR_per_kWh"]]
         )
         plt.plot(
-            bridge.index, bridge.to_numpy() * EUR_TO_NOK,
-            label=f"Forecast ({model_name}/{encoding})", color="crimson",
+            bridge.index, bridge.to_numpy() * eur_nok,
+            label=f"Forecast ({model_dir.name})", color="crimson",
             linewidth=2, linestyle="--",
         )
         plt.fill_between(
@@ -226,7 +266,7 @@ def main() -> None:
             alpha=0.18, color="crimson", label="80% prediction interval",
         )
         plt.axvline(origin, color="gray", linestyle=":", linewidth=1.2, label="Forecast origin")
-        plt.title(f"Price forecast from {origin:%Y-%m-%d %H:%M} ({model_name}, {encoding})")
+        plt.title(f"Price forecast from {origin:%Y-%m-%d %H:%M} ({model_dir.name})")
         plt.xlabel("Time (Europe/Oslo)")
         plt.ylabel("NOK/kWh")
         plt.grid(True, alpha=0.3)
@@ -234,7 +274,7 @@ def main() -> None:
         plt.tight_layout()
 
         out_png = ROOT / "figs" / f"forecast_{tag}_{origin:%Y%m%d_%H%M}.png"
-        save_figure(plt.gcf(), out_png)
+        save_figure(plt.gcf(), out_png, note=f"EUR/NOK {eur_nok:.4f} ({fx_source}); models work in EUR")
 
 
 if __name__ == "__main__":

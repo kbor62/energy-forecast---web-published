@@ -1,7 +1,7 @@
 """Combine historical weather with forecast data.
 
 NOTE: only used by build_features.py --add-weather-forecast (legacy, see README
-section 13.9). Training, forecasting and backtesting do not read the combined file.
+section 12). Training, forecasting and backtesting do not read the combined file.
 
 Merges:
   - Historical weather observations (from fetch_weather.py) — columns without prefix

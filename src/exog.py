@@ -1,8 +1,10 @@
-"""ENTSO-E exogenous features: day-ahead wind/solar forecasts and neighbour prices.
+"""ENTSO-E exogenous features: day-ahead wind/solar and load forecasts, neighbour prices.
 
 One hourly parquet (``fetch_entsoe_exog.py``), columns by name prefix:
 
   wind_<ZONE>_MW, solar_<ZONE>_MW   day-ahead forecast for the TARGET hour -> ``<col>_target``
+  load_<ZONE>_MW                    day-ahead total load forecast for the TARGET hour
+                                    -> ``<col>_target``
   price_<ZONE>_EUR_MWh              neighbour day-ahead price, known up to the ORIGIN
                                     -> ``<col>_origin`` (at the origin) and
                                     ``<col>_origin_lag24h`` (24 h earlier)
@@ -55,6 +57,14 @@ def normalise_wind_solar(df: pd.DataFrame, zone: str) -> pd.DataFrame:
         out[f"solar_{zone}_MW"] = df[solar_cols].sum(axis=1, min_count=1)
     out.index = out.index.tz_localize("UTC") if out.index.tz is None else out.index
     return out.tz_convert(TZ).resample("h").mean()
+
+
+def normalise_load(df, zone: str) -> pd.DataFrame:
+    """entsoe-py load forecast (DataFrame 'Forecasted Load' or Series) -> hourly load_<zone>_MW."""
+    s = df.iloc[:, 0] if isinstance(df, pd.DataFrame) else df
+    s = pd.to_numeric(s, errors="coerce")
+    s.index = s.index.tz_localize("UTC") if s.index.tz is None else s.index
+    return s.tz_convert(TZ).resample("h").mean().rename(f"load_{zone}_MW").to_frame()
 
 
 def load_exog(path, cols: list[str] | None = None) -> pd.DataFrame:

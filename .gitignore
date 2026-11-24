@@ -3,7 +3,7 @@
 __pycache__/
 *.pyc
 
-# Generated results: only source code is versioned (see README section 13.5)
+# Generated results: only source code is versioned (see README section 9.1)
 data/
 models/
 figs/

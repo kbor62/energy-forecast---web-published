@@ -34,6 +34,7 @@ from plotting import (
     OBSERVED,
     SERIES_COLORS,
     format_time_axis,
+    fixed_rate_note,
     save_figure,
     style_axes,
     style_legend,
@@ -138,7 +139,7 @@ def plot_timeseries(price: pd.Series, out) -> None:
     format_time_axis(ax)
     title(ax, "Day-ahead price, NO1", f"{daily.index[0]:%b %Y} - {daily.index[-1]:%b %Y}")
     style_legend(ax.legend(loc="upper right", frameon=True))
-    save_figure(fig, out)
+    save_figure(fig, out, note=fixed_rate_note())
 
 
 def plot_distribution(price: pd.Series, s: dict, out) -> None:
@@ -155,7 +156,7 @@ def plot_distribution(price: pd.Series, s: dict, out) -> None:
         f"negative hours {s['n_negative']:,} ({s['share_negative']:.1%})",
     )
     style_legend(ax.legend(loc="upper right", frameon=True))
-    save_figure(fig, out)
+    save_figure(fig, out, note=fixed_rate_note())
 
 
 def plot_box(price: pd.Series, key: np.ndarray, levels, labels, xlabel: str, heading: str, out) -> None:
@@ -165,7 +166,7 @@ def plot_box(price: pd.Series, key: np.ndarray, levels, labels, xlabel: str, hea
     ax.set_xticks(range(1, len(groups) + 1), labels)
     ax.set_xlabel(xlabel, color=INK_SOFT)
     title(ax, heading, "Box = interquartile range, line = median, whiskers = 1.5 x IQR; points beyond hidden")
-    save_figure(fig, out)
+    save_figure(fig, out, note=fixed_rate_note())
 
 
 def plot_heatmap(price: pd.Series, out) -> pd.DataFrame:
@@ -192,7 +193,7 @@ def plot_heatmap(price: pd.Series, out) -> pd.DataFrame:
     cbar.set_label(f"Mean price ({UNIT})", color=INK_SOFT)
     cbar.outline.set_visible(False)
     title(ax, "Mean price by hour and weekday")
-    save_figure(fig, out)
+    save_figure(fig, out, note=fixed_rate_note())
     return table
 
 
@@ -228,7 +229,7 @@ def plot_outliers(flags: pd.DataFrame, out) -> None:
     format_time_axis(ax)
     title(ax, "Spikes and negative prices", "Spike = more than k robust SDs from a 7-day rolling median")
     style_legend(ax.legend(loc="upper right", frameon=True, markerscale=1.5))
-    save_figure(fig, out)
+    save_figure(fig, out, note=fixed_rate_note())
 
 
 def main() -> None:

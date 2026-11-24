@@ -16,7 +16,7 @@ one column group per location, plus issued_at). The stamp is MET's own
 updated_at, so running twice within one model run stores nothing new. The --out
 file is overwritten on every run; the archive is not. Archived snapshots are what
 forecast.py and backtest_rolling.py --weather_mode archive read, and the only way
-to evaluate weather forecasts honestly. Run this every few hours (README 13.5).
+to evaluate weather forecasts honestly. Run this every few hours (README 4.2).
 Options: --archive_dir, --no_archive.
 
 Usage:

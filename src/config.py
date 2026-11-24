@@ -31,6 +31,21 @@ ENTSOE_TOKEN = os.environ.get("ENTSOE_TOKEN", "")
 FROST_CLIENT_ID = os.environ.get("FROST_CLIENT_ID", "")
 
 
+def redact(text: object) -> str:
+    """Error text with API secrets masked, safe to print or log.
+
+    entsoe-py puts the token in the request URL (securityToken=...), and HTTP
+    errors quote that URL, so any exception message can carry it.
+    """
+    import re
+
+    s = re.sub(r"(securityToken=)[^&\s)]+", r"\1***", str(text))
+    for secret in (ENTSOE_TOKEN, FROST_CLIENT_ID):
+        if secret.strip():
+            s = s.replace(secret.strip(), "***")
+    return s
+
+
 def repo_path(value: str | Path) -> Path:
     """Path relative to the repository root."""
     p = Path(value)

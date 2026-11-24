@@ -2,19 +2,34 @@
 """
 Convenience wrapper for the energy forecast pipeline.
 
-Runs the complete pipeline: fetch prices → build features → train → forecast → (optional) backtest.
-With --exog it also fetches ENTSO-E wind/solar forecasts and neighbour prices and uses them
-as features (combines with --weather).
-With --weather it also fetches weather history (Frost) and archives a MET forecast snapshot,
-trains with weather at the target hour, and forecasts from the latest snapshot.
-Each step can also be run manually; see README.md for details.
+Runs: fetch data -> build features -> train -> forecast -> (optional) backtest.
+Every run retrains unless --skip-train is given. The model directory is named
+from the options: models/lgbm[_wx][_ex][_nwp][_t<mode>][_dl<lag>]. Each step can
+also be run by hand; see README.md.
 
-Usage:
-  python run_pipeline.py
-  python run_pipeline.py --weather
-  python run_pipeline.py --model ridge_ohe --encoding both
-  python run_pipeline.py --skip-price-fetch --weather   # fetch only the weather
-  python run_pipeline.py --skip-fetch --backtest --backtest-start "2026-01-01 00:00" --backtest-end "2026-08-31 00:00"
+Production (D+2/D+3, run after ~13:00 when the D+1 auction prices are published):
+  python run_pipeline.py --exog --nwp --decision-lag-hours 33 --target-mode diff_sameh
+      -> models/lgbm_ex_nwp_tdiff_sameh_dl33, data/forecast_lgbm_ex_nwp_tdiff_sameh_dl33.csv
+
+  Same, fresh data but no retraining (e.g. daily, with weekly retraining):
+  python run_pipeline.py --exog --nwp --decision-lag-hours 33 --target-mode diff_sameh --skip-train
+
+  Backtest of the production setup on existing data (no downloads; one command):
+  python run_pipeline.py --exog --nwp --decision-lag-hours 33 --target-mode diff_sameh --skip-fetch --backtest --backtest-start "2026-01-01 00:00" --backtest-end "2026-08-31 00:00" --backtest-origin-hour 23
+
+Other setups:
+  python run_pipeline.py                  price only, D+1 before the auction (fallback, models/lgbm)
+  python run_pipeline.py --exog           D+1 before the auction (run before ~12:00) with ENTSO-E
+                                          wind/solar/load forecasts and neighbour prices
+  python run_pipeline.py --weather        observed Oslo weather (Frost) for training, latest MET
+                                          forecast snapshot for forecasting
+
+Downloads:
+  --skip-fetch          no downloads at all (existing files)
+  --skip-price-fetch    skip only the prices
+  --skip-exog-fetch     skip only the ENTSO-E exog file
+  --skip-nwp-fetch      skip only the Open-Meteo file
+  --skip-weather-fetch  skip only the Frost history and MET snapshot
 """
 
 import argparse
@@ -44,17 +59,6 @@ def run_command(cmd, name):
     return result
 
 
-def default_encoding_for(model):
-    result = subprocess.run(
-        [sys.executable, "-c",
-         f"import sys; sys.path.insert(0, 'src'); from models import DEFAULT_ENCODING; print(DEFAULT_ENCODING['{model}'])"],
-        cwd=repo_root, capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Could not determine default encoding for {model}")
-    return result.stdout.strip()
-
-
 def check_weather_freshness(price_parquet, weather_path, max_gap_hours=24):
     """Warn if the weather history ends well before the price data (those rows train with NaN weather)."""
     import pandas as pd
@@ -72,22 +76,10 @@ def check_weather_freshness(price_parquet, weather_path, max_gap_hours=24):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run the energy forecast pipeline.",
-        epilog="See README.md for detailed step-by-step instructions."
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument(
-        "--model",
-        default="lgbm",
-        choices=["lgbm", "ridge", "ridge_ohe"],
-        help="Model family (default: lgbm)"
-    )
-    parser.add_argument(
-        "--encoding",
-        default="",
-        choices=["", "trig", "int", "both"],
-        help="Calendar encoding (default: model's default encoding)"
-    )
     parser.add_argument(
         "--zone",
         default="NO_1",
@@ -125,7 +117,7 @@ def main():
         "--weather",
         action="store_true",
         help="Add weather: fetch Frost history + MET forecast snapshot, train with weather, "
-             "forecast from the snapshot. Models go to models/<model>_<enc>_wx. "
+             "forecast from the snapshot. Models go to models/lgbm_wx. "
              "Needs FROST_CLIENT_ID in .env. --skip-fetch / --skip-weather-fetch skip the weather downloads."
     )
     parser.add_argument(
@@ -133,7 +125,43 @@ def main():
         action="store_true",
         help="Add ENTSO-E exog features: day-ahead wind/solar forecasts of neighbouring zones and neighbour prices "
              "(fetch_entsoe_exog.py, needs ENTSOE_TOKEN). Combines with --weather. Models go to "
-             "models/<model>_<enc>[_wx]_ex. --skip-fetch / --skip-exog-fetch skip the download."
+             "models/lgbm[_wx]_ex. --skip-fetch / --skip-exog-fetch skip the download."
+    )
+    parser.add_argument(
+        "--skip-train",
+        action="store_true",
+        help="Skip feature build and training; forecast with the existing models in models/lgbm[_wx][_ex]. "
+             "Fetching still runs, so this gives a fresh forecast from updated prices/weather/exog"
+    )
+    parser.add_argument(
+        "--nwp",
+        action="store_true",
+        help="Add weather-model forecasts (fetch_openmeteo.py -> data/nwp_openmeteo.parquet). Models go to "
+             "models/lgbm[_wx][_ex]_nwp. --skip-fetch / --skip-nwp-fetch skip the download."
+    )
+    parser.add_argument(
+        "--skip-nwp-fetch",
+        action="store_true",
+        help="Skip only the Open-Meteo download (use the existing --nwp-file)"
+    )
+    parser.add_argument(
+        "--nwp-file",
+        default="data/nwp_openmeteo.parquet",
+        help="Open-Meteo NWP parquet (default: data/nwp_openmeteo.parquet)"
+    )
+    parser.add_argument(
+        "--decision-lag-hours",
+        type=int,
+        default=11,
+        help="Hours from decision time to origin. 11 (default): forecast tomorrow before the auction. "
+             "33: forecast D+2/D+3 at ~14:00 when tomorrow's prices are known (model dir suffix _dl33)"
+    )
+    parser.add_argument(
+        "--target-mode",
+        default="level",
+        choices=["level", "diff_sameh", "diff_mean24", "rel_mean24"],
+        help="Forecast the price level (default) or the change from a known anchor (see src/targets.py). "
+             "Non-default modes add the model dir suffix _t<mode>"
     )
     parser.add_argument(
         "--skip-exog-fetch",
@@ -202,9 +230,7 @@ def main():
     print(f"\n{'='*70}")
     print(f"Energy Forecast Pipeline")
     print(f"{'='*70}")
-    print(f"Model: {args.model}")
-    if args.encoding:
-        print(f"Encoding: {args.encoding}")
+    print("Model: lgbm")
     print(f"Zone: {args.zone}")
     print(f"Horizon: {args.horizon}h")
     print(f"Validation: {args.val_days} days")
@@ -251,7 +277,8 @@ def main():
                 snap = subprocess.run([sys.executable, "src/fetch_weather_forecast.py"], cwd=repo_root)
                 if snap.returncode != 0:
                     print("WARNING: forecast snapshot failed; forecast will use the latest earlier snapshot, if any")
-            check_weather_freshness(price_parquet, weather_path)
+            if not args.skip_train:
+                check_weather_freshness(price_parquet, weather_path)
 
         # Step 1c: ENTSO-E exog (optional)
         exog_path = repo_root / args.exog_file
@@ -266,62 +293,68 @@ def main():
                     "1c: Fetch ENTSO-E wind/solar forecasts and neighbour prices"
                 )
 
+        # Step 1e: EUR/NOK from Norges Bank (best effort; forecast.py falls back to the fixed rate)
+        if not args.skip_fetch:
+            fxr = subprocess.run([sys.executable, "src/fx.py"], cwd=repo_root)
+            if fxr.returncode != 0:
+                print("WARNING: EUR/NOK fetch failed; the forecast uses the last stored or the fixed rate")
+
+        # Step 1d: Open-Meteo weather-model forecasts (optional)
+        nwp_path = repo_root / args.nwp_file
+        if args.nwp:
+            if args.skip_fetch or args.skip_nwp_fetch:
+                print("Step 1d: Skipping Open-Meteo download (--skip-fetch / --skip-nwp-fetch)")
+                if not nwp_path.exists():
+                    raise FileNotFoundError(f"--nwp needs {nwp_path}; run without --skip-fetch / --skip-nwp-fetch first")
+            else:
+                run_command(
+                    [sys.executable, "src/fetch_openmeteo.py", "--out", str(nwp_path)],
+                    "1d: Fetch weather-model forecasts (Open-Meteo)"
+                )
+
         # Step 2: Build features
-        run_command(
-            [
-                sys.executable, "src/build_features.py",
-                "--inp", str(price_parquet),
-                "--out", str(features_file),
-                "--horizon", str(args.horizon)
-            ],
-            "2/4: Build features"
-        )
+        if args.skip_train:
+            print("Steps 2-3/4: Skipping feature build and training (--skip-train)")
+        else:
+            run_command(
+                [
+                    sys.executable, "src/build_features.py",
+                    "--inp", str(price_parquet),
+                    "--out", str(features_file),
+                    "--horizon", str(args.horizon)
+                ],
+                "2/4: Build features"
+            )
 
         # Step 3: Train
         train_cmd = [
             sys.executable, "src/train.py",
             "--inp", str(features_file),
-            "--model", args.model,
             "--horizon", str(args.horizon),
             "--val_days", str(args.val_days)
         ]
-        if args.encoding:
-            train_cmd.extend(["--encoding", args.encoding])
 
-        model_dir = None
-        if args.weather or args.exog:
-            # Keep models with extra features apart from the price-only models.
-            enc = args.encoding or default_encoding_for(args.model)
-            suffix = ("_wx" if args.weather else "") + ("_ex" if args.exog else "")
-            model_dir = repo_root / f"models/{args.model}_{enc}{suffix}"
-            train_cmd.extend(["--out_dir", str(model_dir)])
+        # Models with extra features are kept apart from the price-only models.
+        suffix = ("_wx" if args.weather else "") + ("_ex" if args.exog else "") + ("_nwp" if args.nwp else "")
+        if args.target_mode != "level":
+            suffix += f"_t{args.target_mode}"
+        if args.decision_lag_hours != 11:
+            suffix += f"_dl{args.decision_lag_hours}"
+        model_dir = repo_root / f"models/lgbm{suffix}"
+        train_cmd.extend(["--out_dir", str(model_dir), "--decision_lag_hours", str(args.decision_lag_hours),
+                          "--target_mode", args.target_mode])
         if args.weather:
             train_cmd.extend(["--weather_file", args.weather_file])
         if args.exog:
             train_cmd.extend(["--exog_file", args.exog_file])
+        if args.nwp:
+            train_cmd.extend(["--nwp_file", args.nwp_file])
 
-        run_command(train_cmd, f"3/4: Train ({args.model}{'_' + args.encoding if args.encoding else ''})")
+        if not args.skip_train:
+            run_command(train_cmd, f"3/4: Train ({model_dir.name})")
 
-        # Determine model directory
-        if model_dir is not None:
-            pass
-        elif args.encoding:
-            model_dir = repo_root / f"models/{args.model}_{args.encoding}"
-        else:
-            # Query the model's default encoding from Python
-            result = subprocess.run(
-                [
-                    sys.executable, "-c",
-                    f"import sys; sys.path.insert(0, 'src'); from models import DEFAULT_ENCODING; print(DEFAULT_ENCODING['{args.model}'])"
-                ],
-                cwd=repo_root,
-                capture_output=True,
-                text=True
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"Could not determine default encoding for {args.model}")
-            default_encoding = result.stdout.strip()
-            model_dir = repo_root / f"models/{args.model}_{default_encoding}"
+        if args.skip_train and not (model_dir / "manifest.json").exists():
+            raise FileNotFoundError(f"--skip-train needs trained models in {model_dir}; run once without --skip-train")
 
         # Step 4: Forecast
         run_command(
@@ -340,19 +373,18 @@ def main():
             backtest_cmd = [
                 sys.executable, "src/backtest_rolling.py",
                 "--inp", str(price_parquet),
-                "--model", args.model,
                 "--start", args.backtest_start,
                 "--end", args.backtest_end,
                 "--step", str(args.horizon),
-                "--horizon", str(args.horizon)
+                "--horizon", str(args.horizon),
+                "--decision_lag_hours", str(args.decision_lag_hours),
+                "--target_mode", args.target_mode
             ]
-            if args.encoding:
-                backtest_cmd.extend(["--encoding", args.encoding])
 
             if args.backtest_origin_hour is not None:
                 backtest_cmd.extend(["--origin_hour", str(args.backtest_origin_hour),
                                      "--snapshot_lag_hours", str(args.backtest_snapshot_lag)])
-            backtest_name = model_dir.name.removesuffix("_ex").removesuffix("_wx")
+            backtest_name = "lgbm"
             if args.weather:
                 backtest_cmd.extend(["--weather_file", args.weather_file,
                                      "--weather_mode", args.backtest_weather_mode])
@@ -360,6 +392,13 @@ def main():
             if args.exog:
                 backtest_cmd.extend(["--exog_file", args.exog_file])
                 backtest_name += "_ex"
+            if args.nwp:
+                backtest_cmd.extend(["--nwp_file", args.nwp_file])
+                backtest_name += "_nwp"
+            if args.target_mode != "level":
+                backtest_name += f"_t{args.target_mode}"
+            if args.decision_lag_hours != 11:
+                backtest_name += f"_dl{args.decision_lag_hours}"
             if args.backtest_origin_hour is not None:
                 backtest_name += f"_o{args.backtest_origin_hour}"
 
@@ -376,6 +415,8 @@ def main():
             print(f"  Weather:    {weather_path} (+ snapshots in data/forecast_archive/)")
         if args.exog:
             print(f"  ENTSO-E:    {exog_path}")
+        if args.nwp:
+            print(f"  NWP:        {nwp_path}")
         print(f"  Forecast:   data/forecast_{model_dir.name}.csv")
         print(f"  Figures:    figs/")
         if args.backtest:

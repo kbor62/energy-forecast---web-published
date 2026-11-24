@@ -1,10 +1,12 @@
-# Versions used for the results in README.md section 11 (see section 1).
+# Pinned: saved models need the same scikit-learn version; see README.md section 9.2
+# before upgrading.
 pandas==3.0.6
 numpy==2.5.3
 scikit-learn==1.9.1
 lightgbm==4.7.0
 
 # Required by the pipeline; any recent version works.
+holidays          # is_holiday feature (needs include_sundays support, >= 0.60)
 pyarrow
 matplotlib
 joblib

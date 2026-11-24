@@ -23,14 +23,14 @@ import pandas as pd
 import shutil
 
 
-def run_test(model, encoding, features_file, output_dir, label):
+def run_test(features_file, output_dir, label):
     """Run training with given features file and output directory."""
     print(f"\n{'='*70}")
     print(f"TEST: {label}")
     print(f"{'='*70}")
     print(f"Features: {features_file}")
     print(f"Model output: {output_dir}")
-    print(f"Model: {model}_{encoding}\n")
+    print("Model: lgbm\n")
 
     # Copy features file
     src = Path("data") / features_file
@@ -48,8 +48,6 @@ def run_test(model, encoding, features_file, output_dir, label):
     # Train with specific output directory
     train_cmd = [
         "python", "src/train.py",
-        "--model", model,
-        "--encoding", encoding,
         "--horizon", "48",
         "--val_days", "30",
         "--out_dir", output_dir
@@ -85,17 +83,15 @@ def main():
 
     # Test 1: Without temperature
     mae_without = run_test(
-        "lgbm", "int",
         "features_price_only.parquet",
-        "models/lgbm_int_baseline",
+        "models/lgbm_baseline",
         "BASELINE: Price history only"
     )
 
     # Test 2: With temperature
     mae_with = run_test(
-        "lgbm", "int",
         "features_price_temp.parquet",
-        "models/lgbm_int_with_temp",
+        "models/lgbm_with_temp",
         "WEATHER TEST: Price history + Temperature lags"
     )
 

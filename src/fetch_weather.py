@@ -61,7 +61,7 @@ Notes:
       wind_speed_ms and precipitation_mm: Blindern returns no hourly cloud element, so
       that column is simply absent. Training uses those three columns (--weather_cols).
     - Observed weather is what train.py --weather_file uses; it is NOT a forecast
-      (see README section 13).
+      (see README section 6.4).
     - Missing values are forward-filled (limit 3 hours) for temperature/wind
     - Cloud coverage often has gaps (filled with mean of day)
     - API rate limit: ~10 requests per minute (script includes delays)

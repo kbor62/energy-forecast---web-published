@@ -6,7 +6,7 @@ Trains two models with identical settings:
      data/weather_oslo.parquet)
 
 The weather is OBSERVED, so the result is an upper bound on the value of a real
-forecast. Honest evaluation needs archived forecasts (README section 13).
+forecast. Honest evaluation needs archived forecasts (README section 6.4).
 
 If the weather model's MAE doesn't improve by at least THRESHOLD_PCT, the test
 concludes that weather forecast features add no value.
@@ -33,8 +33,6 @@ WEATHER_OUT = f"models/lgbm_weather_test_{_ts}"
 
 TRAIN_CMD = [
     sys.executable, "src/train.py",
-    "--model", "lgbm",
-    "--encoding", "int",
     "--horizon", "48",
     "--val_days", "30",
 ]

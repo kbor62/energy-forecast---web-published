@@ -9,7 +9,7 @@ Weather (optional): ``assemble(..., weather=df)`` appends ``<col>_target`` colum
 holding the weather at the target hour t+h. They are not part of
 ``feature_columns``; the caller (train / forecast / backtest) supplies them. In
 training and the default backtest the values are observed weather, i.e. an
-upper bound on what a real forecast delivers (see README section 13).
+upper bound on what a real forecast delivers (see README section 6.4).
 """
 
 from __future__ import annotations
@@ -22,28 +22,23 @@ from config import TZ
 LAGS_H = [1, 2, 3, 6, 12, 24, 48, 72, 168]
 ROLLS_H = [6, 12, 24, 72, 168]
 DIFFS_H = [24, 168]
-HOUR_HARMONICS = 2  # two harmonics capture the morning and evening peaks
-YEAR_HARMONICS = 3
 
-ENCODINGS = ("trig", "int", "both")
-
+# Calendar features (evaluated at the target hour t+h):
+#   hour, dow   categorical (LightGBM groups any set of levels in one split)
+#   month       integer 1-12
+#   is_holiday  Norwegian public holiday (holidays package, Sundays excluded)
+# Day-of-year harmonics were tested and removed: they let the trees single out
+# individual periods and made the backtest about 5 % worse.
 # Fixed category levels, independent of the training data.
 CAT_LEVELS: dict[str, list[int]] = {
     "hour": list(range(24)),
     "dow": list(range(7)),
-    "month": list(range(1, 13)),
-    "season": [0, 1, 2, 3],  # 0 winter, 1 spring, 2 summer, 3 fall
-    "is_weekday": [0, 1],
 }
 CAT_COLS: list[str] = list(CAT_LEVELS)
 
-TRIG_COLS: list[str] = (
-    [f"sin_hour_{k}" for k in range(1, HOUR_HARMONICS + 1)]
-    + [f"cos_hour_{k}" for k in range(1, HOUR_HARMONICS + 1)]
-    + ["sin_dow", "cos_dow"]
-    + [f"year_sin_{k}" for k in range(1, YEAR_HARMONICS + 1)]
-    + [f"year_cos_{k}" for k in range(1, YEAR_HARMONICS + 1)]
-)
+CALENDAR_COLS: list[str] = [*CAT_COLS, "month", "is_holiday"]
+
+HOLIDAY_COUNTRY = "NO"
 
 # lag0h is the price at the forecast origin (the persistence baseline).
 HISTORY_COLS: list[str] = (
@@ -56,25 +51,21 @@ HISTORY_COLS: list[str] = (
 MAX_HISTORY_HOURS = max(LAGS_H + ROLLS_H + DIFFS_H)
 
 
-def calendar_columns(encoding: str) -> list[str]:
-    if encoding == "trig":
-        return [*TRIG_COLS, "is_weekday"]
-    if encoding == "int":
-        return list(CAT_COLS)
-    return [*CAT_COLS, *TRIG_COLS]
+def calendar_columns() -> list[str]:
+    return list(CALENDAR_COLS)
 
 
-def categorical_columns(encoding: str) -> list[str]:
-    return [] if encoding == "trig" else list(CAT_COLS)
+def categorical_columns() -> list[str]:
+    return list(CAT_COLS)
 
 
 def history_columns() -> list[str]:
     return list(HISTORY_COLS)
 
 
-def feature_columns(encoding: str) -> list[str]:
-    """Ordered feature list for an encoding."""
-    return [*calendar_columns(encoding), *HISTORY_COLS]
+def feature_columns() -> list[str]:
+    """Ordered list of the calendar and history features."""
+    return [*CALENDAR_COLS, *HISTORY_COLS]
 
 
 def history_features(price: pd.Series) -> pd.DataFrame:
@@ -97,51 +88,42 @@ def history_features(price: pd.Series) -> pd.DataFrame:
     return feat.loc[:, HISTORY_COLS]
 
 
-def calendar_features(index, encoding: str = "trig") -> pd.DataFrame:
-    """Calendar features for the given timestamps."""
+def holiday_flags(dates) -> np.ndarray:
+    """1 where the local date is a Norwegian public holiday (Sundays not counted), else 0."""
+    import holidays
+
+    dates = pd.DatetimeIndex(dates)
+    if len(dates) == 0:
+        return np.zeros(0, dtype="int16")
+    days = holidays.country_holidays(
+        HOLIDAY_COUNTRY, years=range(dates.year.min(), dates.year.max() + 1), include_sundays=False
+    )
+    local_days = dates.tz_localize(None).to_numpy().astype("datetime64[D]")
+    return np.isin(local_days, np.array(sorted(days), dtype="datetime64[D]")).astype("int16")
+
+
+def calendar_features(index) -> pd.DataFrame:
+    """Calendar features for the given timestamps (local time)."""
     idx = pd.DatetimeIndex(index)
     idx = idx.tz_localize(TZ) if idx.tz is None else idx.tz_convert(TZ)
 
-    hour = idx.hour.to_numpy()
-    dow = idx.dayofweek.to_numpy()
-    month = idx.month.to_numpy()
-
     out = pd.DataFrame(index=idx)
+    out["hour"] = idx.hour.to_numpy().astype("int16")
+    out["dow"] = idx.dayofweek.to_numpy().astype("int16")
+    out["month"] = idx.month.to_numpy().astype("int16")
+    out["is_holiday"] = holiday_flags(idx)
 
-    if encoding in ("int", "both"):
-        season = np.zeros(len(idx), dtype="int16")  # winter
-        season[np.isin(month, [3, 4, 5])] = 1
-        season[np.isin(month, [6, 7, 8])] = 2
-        season[np.isin(month, [9, 10, 11])] = 3
-        out["hour"] = hour.astype("int16")
-        out["dow"] = dow.astype("int16")
-        out["month"] = month.astype("int16")
-        out["season"] = season
-
-    if encoding in ("trig", "both"):
-        for k in range(1, HOUR_HARMONICS + 1):
-            out[f"sin_hour_{k}"] = np.sin(2 * np.pi * k * hour / 24)
-            out[f"cos_hour_{k}"] = np.cos(2 * np.pi * k * hour / 24)
-        out["sin_dow"] = np.sin(2 * np.pi * dow / 7)
-        out["cos_dow"] = np.cos(2 * np.pi * dow / 7)
-        doy = idx.dayofyear.to_numpy().astype(float)
-        for k in range(1, YEAR_HARMONICS + 1):
-            ang = 2 * np.pi * k * doy / 365.2425
-            out[f"year_sin_{k}"] = np.sin(ang)
-            out[f"year_cos_{k}"] = np.cos(ang)
-
-    out["is_weekday"] = (dow < 5).astype("int16")
-
-    return out.loc[:, calendar_columns(encoding)]
+    return out.loc[:, CALENDAR_COLS]
 
 
 def assemble(
     history: pd.DataFrame,
     origins,
     horizon: int,
-    encoding: str = "trig",
     weather: pd.DataFrame | None = None,
     exog: pd.DataFrame | None = None,
+    nwp: pd.DataFrame | None = None,
+    decision_lag_h: int | None = None,
 ) -> pd.DataFrame:
     """Design matrix: history at each origin, calendar at origin + horizon.
 
@@ -154,10 +136,18 @@ def assemble(
     given, its features are appended after the weather columns: ``<col>_target`` for
     target-hour forecasts (NaN where not yet published at the decision time) and
     ``<col>_origin`` / ``<col>_origin_lag24h`` for neighbour prices.
+
+    If ``nwp`` (archived weather-model forecasts, see nwp.py) is given, ``<base>_target``
+    columns follow: the forecast for t+h from the newest run available at the decision time.
+
+    ``decision_lag_h``: hours between the decision time and the origin (default
+    exog.DECISION_LAG_H = 11: origin 23:00, decision 12:00 the same day, forecasting
+    tomorrow. 33: origin 23:00 on D+1 (prices known), decision 14:00 on D, forecasting
+    D+2 and D+3). Used by the exog availability rule and the NWP lead choice.
     """
     origins = pd.DatetimeIndex(origins)
     targets = origins + pd.Timedelta(hours=horizon)
-    calendar = calendar_features(targets, encoding)
+    calendar = calendar_features(targets)
     calendar.index = origins
 
     parts = [calendar, history.loc[origins, HISTORY_COLS]]
@@ -165,25 +155,30 @@ def assemble(
         w = weather.reindex(targets)
         w.index = origins
         parts.append(w.add_suffix("_target"))
-    cols = feature_columns(encoding)
+    cols = feature_columns()
     if weather is not None:
         cols = cols + [f"{c}_target" for c in weather.columns]
-    if exog is not None:
-        import exog as _exog
+    import exog as _exog
 
-        block = _exog.exog_features(exog, origins, horizon)
+    lag = _exog.DECISION_LAG_H if decision_lag_h is None else int(decision_lag_h)
+    if exog is not None:
+        block = _exog.exog_features(exog, origins, horizon, lag)
+        parts.append(block)
+        cols = cols + list(block.columns)
+    if nwp is not None:
+        import nwp as _nwp
+
+        block = _nwp.nwp_features(nwp, origins, horizon, lag)
         parts.append(block)
         cols = cols + list(block.columns)
     X = pd.concat(parts, axis=1)
     return X.loc[:, cols]
 
 
-def as_categorical(X: pd.DataFrame, cat_cols: list[str]) -> pd.DataFrame:
-    """Convert calendar columns to pandas category dtype (for LightGBM)."""
-    if not cat_cols:
-        return X
+def as_categorical(X: pd.DataFrame) -> pd.DataFrame:
+    """Convert hour and dow to pandas category dtype with fixed levels (for LightGBM)."""
     X = X.copy()
-    for c in cat_cols:
+    for c in CAT_COLS:
         if c in X.columns:
             X[c] = pd.Categorical(X[c], categories=CAT_LEVELS[c])
     return X
@@ -214,18 +209,20 @@ def train_val_masks(
     return np.asarray(index < train_end), np.asarray(index >= val_start)
 
 
-def feature_definition(encoding: str) -> dict:
+def feature_definition() -> dict:
     """Description of the feature set, written to output metadata."""
     return {
-        "encoding": encoding,
         "lags_h": list(LAGS_H),
         "rolling_windows_h": list(ROLLS_H),
         "diffs_h": list(DIFFS_H),
-        "hour_harmonics": HOUR_HARMONICS,
-        "year_harmonics": YEAR_HARMONICS,
+        "calendar": {
+            "categorical": list(CAT_COLS),
+            "integer": ["month"],
+            "holiday": f"is_holiday ({HOLIDAY_COUNTRY} public holidays, Sundays excluded)",
+        },
         "calendar_evaluated_at": "target hour (t+h)",
         "rolling_computed_on": "price.shift(1)",
         "includes_origin_price": True,
-        "n_features": len(feature_columns(encoding)),
-        "columns": feature_columns(encoding),
+        "n_features": len(feature_columns()),
+        "columns": feature_columns(),
     }

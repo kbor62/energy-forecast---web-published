@@ -48,11 +48,34 @@ def style_legend(legend) -> None:
         text.set_color(INK)
 
 
-def save_figure(fig, out_png: str | Path, dpi: int = 150, close: bool = True) -> Path:
-    """Write a figure to ``out_png``, creating the folder if needed."""
+def fixed_rate_note() -> str:
+    """Info text for figures whose NOK values use the fixed config rate."""
+    from config import EUR_TO_NOK
+
+    return f"NOK at fixed EUR/NOK {EUR_TO_NOK:.2f} (config.EUR_TO_NOK); models work in EUR"
+
+
+def save_figure(fig, out_png: str | Path, dpi: int = 150, close: bool = True, note: str | None = None) -> Path:
+    """Write a figure to ``out_png``, creating the folder if needed. ``note``: small info
+    line under the plot (e.g. the EUR/NOK rate used)."""
     out_png = Path(out_png)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=dpi, bbox_inches="tight", facecolor="white")
+    if note:
+        fig.text(0.995, 0.0, note, ha="right", va="top", fontsize=8, color=INK_SOFT,
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f3", edgecolor=GRID, linewidth=0.6))
+    try:
+        fig.savefig(out_png, dpi=dpi, bbox_inches="tight", facecolor="white")
+    except OSError as exc:
+        # The target can be locked on Windows (open in an image viewer or the Explorer
+        # preview pane, or held by a cloud-sync client). Do not fail the pipeline over a
+        # figure: write a time-stamped copy next to it instead.
+        import datetime as _dt
+
+        alt = out_png.with_name(f"{out_png.stem}_{_dt.datetime.now():%Y%m%d_%H%M%S}{out_png.suffix}")
+        print(f"  WARNING: could not write {out_png.name} ({exc.__class__.__name__}: {exc}); "
+              f"is it open in another program? Saved as {alt.name}")
+        fig.savefig(alt, dpi=dpi, bbox_inches="tight", facecolor="white")
+        out_png = alt
     if close:
         plt.close(fig)
 

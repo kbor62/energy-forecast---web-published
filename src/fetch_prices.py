@@ -17,7 +17,7 @@ import json
 import time
 import pandas as pd
 
-from config import BRUSSELS_TZ, ENTSOE_TOKEN, TZ, repo_path
+from config import BRUSSELS_TZ, ENTSOE_TOKEN, TZ, redact, repo_path
 from incremental import plan_start
 
 ZONES_HINT = "NO_1 Oslo, NO_2 Kristiansand, NO_3 Trondheim, NO_4 Tromso, NO_5 Bergen"
@@ -102,10 +102,10 @@ def main() -> None:
                 if attempt == args.retries - 1:
                     raise RuntimeError(
                         f"ENTSO-E chunk {a.date()} -> {b.date()} failed after "
-                        f"{args.retries} attempts: {exc}"
-                    ) from exc
+                        f"{args.retries} attempts: {redact(exc)}"
+                    ) from None
                 wait = 2**attempt
-                print(f"  attempt {attempt + 1} failed: {exc} -- retrying in {wait}s")
+                print(f"  attempt {attempt + 1} failed: {redact(exc)} -- retrying in {wait}s")
                 time.sleep(wait)
         time.sleep(float(args.sleep))
 

@@ -1,8 +1,8 @@
 """Leakage and consistency tests: features are causal, training and forecasting
 build the same feature vector, training labels stay out of the validation
 window, 15-minute prices are averaged to hourly means, and the weather
-features / forecast snapshots behave (target-hour alignment, ridge keeps the
-weather columns, snapshot choice never looks ahead, snapshot-only mode has no
+features / forecast snapshots behave (target-hour alignment, holiday flag,
+snapshot choice never looks ahead, snapshot-only mode has no
 fallback to observations, archiving is idempotent).
 
     python tests/test_pipeline.py
@@ -90,7 +90,7 @@ def test_calendar_block_describes_the_target_hour():
     origins = history.index[300:320]
 
     for h in (1, 13, 48):
-        X = F.assemble(history, origins, h, encoding="int")
+        X = F.assemble(history, origins, h)
         target_idx = origins + pd.Timedelta(hours=h)
         assert np.array_equal(X["hour"].to_numpy(), target_idx.hour.to_numpy())
         assert np.array_equal(X["dow"].to_numpy(), target_idx.dayofweek.to_numpy())
@@ -101,7 +101,7 @@ def test_history_block_describes_the_origin_hour():
     price = synthetic_price()
     history = F.history_features(price)
     origins = history.index[300:320]
-    X = F.assemble(history, origins, 48, encoding="int")
+    X = F.assemble(history, origins, 48)
     assert np.allclose(X["lag0h"].to_numpy(), price.loc[origins].to_numpy())
 
 
@@ -112,31 +112,48 @@ def test_forecast_row_matches_the_training_row():
     origins = history.index[500:540]
     origin = origins[17]
 
-    for encoding in F.ENCODINGS:
-        bulk = F.assemble(history, origins, 48, encoding)
-        single = F.assemble(history, [origin], 48, encoding)
-        assert list(bulk.columns) == list(single.columns)
-        pd.testing.assert_frame_equal(bulk.loc[[origin]], single)
+    bulk = F.assemble(history, origins, 48)
+    single = F.assemble(history, [origin], 48)
+    assert list(bulk.columns) == list(single.columns)
+    pd.testing.assert_frame_equal(bulk.loc[[origin]], single)
 
 
 def test_feature_columns_are_deterministic_and_target_free():
-    for encoding in F.ENCODINGS:
-        cols = F.feature_columns(encoding)
-        assert cols == F.feature_columns(encoding)
-        assert len(cols) == len(set(cols)), "duplicate feature names"
-        assert not any(c.startswith("target") for c in cols)
-        assert not any(c.startswith("price_") for c in cols)
+    cols = F.feature_columns()
+    assert cols == F.feature_columns()
+    assert len(cols) == len(set(cols)), "duplicate feature names"
+    assert not any(c.startswith("target") for c in cols)
+    assert not any(c.startswith("price_") for c in cols)
 
 
 def test_categorical_levels_are_fixed_not_data_dependent():
-    """A slice missing whole seasons still produces the full category domain."""
+    """A slice missing hours/weekdays still produces the full category domain;
+    only hour and dow are categorical, month stays an integer."""
     price = synthetic_price()
-    january = price.loc["2024-01-01":"2024-01-20"]
-    X = F.as_categorical(
-        F.calendar_features(january.index, "int"), F.categorical_columns("int")
-    )
-    assert list(X["month"].cat.categories) == F.CAT_LEVELS["month"]
-    assert list(X["season"].cat.categories) == F.CAT_LEVELS["season"]
+    morning = price.loc["2024-01-01 06:00":"2024-01-02 09:00"]
+    morning = morning[morning.index.hour < 10]
+    X = F.as_categorical(F.calendar_features(morning.index))
+    assert list(X["hour"].cat.categories) == F.CAT_LEVELS["hour"]
+    assert list(X["dow"].cat.categories) == F.CAT_LEVELS["dow"]
+    assert not isinstance(X["month"].dtype, pd.CategoricalDtype)
+    assert not isinstance(X["is_holiday"].dtype, pd.CategoricalDtype)
+
+
+def test_holiday_flag_uses_the_local_date_of_the_target_hour():
+    """17 May and Christmas Day are holidays, 24 Dec and ordinary Sundays are not;
+    the flag follows the target hour's local (Europe/Oslo) date."""
+    idx = pd.DatetimeIndex(
+        ["2024-05-16 23:00", "2024-05-17 00:00", "2024-05-17 23:00", "2024-05-18 00:00",
+         "2024-12-24 12:00", "2024-12-25 12:00", "2024-06-02 12:00"]
+    ).tz_localize(TZ)
+    assert F.calendar_features(idx)["is_holiday"].tolist() == [0, 1, 1, 0, 0, 1, 0]
+
+    # Origin 23:00 on 16 May: h=1 is 00:00 on 17 May (holiday), h=25 is 00:00 on 18 May.
+    price = synthetic_price()
+    history = F.history_features(price)
+    origin = pd.Timestamp("2024-05-16 23:00", tz=TZ)
+    assert int(F.assemble(history, [origin], 1)["is_holiday"].iloc[0]) == 1
+    assert int(F.assemble(history, [origin], 25)["is_holiday"].iloc[0]) == 0
 
 
 def test_embargo_keeps_training_labels_out_of_validation():
@@ -226,7 +243,7 @@ def test_weather_features_describe_the_target_hour():
     origins = price.index[400:405]
 
     for h in (1, 24):
-        X = F.assemble(history, origins, h, "int", weather=weather)
+        X = F.assemble(history, origins, h, weather=weather)
         expected = weather["temperature_C"].reindex(origins + pd.Timedelta(hours=h)).to_numpy()
         assert np.allclose(X["temperature_C_target"].to_numpy(), expected)
         assert list(X.columns[-2:]) == ["temperature_C_target", "wind_speed_ms_target"]
@@ -236,29 +253,8 @@ def test_assemble_without_weather_is_unchanged():
     """No weather argument -> exactly the price-only feature set."""
     price = synthetic_price()
     history = F.history_features(price)
-    X = F.assemble(history, price.index[400:403], 6, "int")
-    assert list(X.columns) == F.feature_columns("int")
-
-
-def test_ridge_uses_the_weather_columns():
-    """Ridge must not silently drop weather columns (remainder='drop')."""
-    import models as M
-
-    price = synthetic_price()
-    history = F.history_features(price).iloc[F.MAX_HISTORY_HOURS:]
-    weather = _weather_frame(price.index)
-    origins = history.index[:-6]
-    y = price.shift(-6).loc[origins].to_numpy()
-
-    X = F.assemble(history, origins, 6, "trig", weather=weather)
-    cols = ["temperature_C_target", "wind_speed_ms_target"]
-    est = M.build_estimator("ridge", "trig", alpha="1.0", extra_cols=cols)
-    est.fit(X, y)
-    assert est.named_steps["pre"].transform(X.iloc[:2]).shape[1] == X.shape[1]
-
-    dropped = M.build_estimator("ridge", "trig", alpha="1.0")
-    dropped.fit(X, y)
-    assert dropped.named_steps["pre"].transform(X.iloc[:2]).shape[1] == X.shape[1] - len(cols)
+    X = F.assemble(history, price.index[400:403], 6)
+    assert list(X.columns) == F.feature_columns()
 
 
 def _write_snapshot(archive: Path, issued: str, start: str, hours: int) -> None:
@@ -379,7 +375,8 @@ def test_origin_hour_validation_and_dst_gaps():
 def _exog_frame(n_hours: int = 24 * 12) -> pd.DataFrame:
     idx = pd.date_range("2026-03-01", periods=n_hours, freq="h", tz=TZ)
     pos = np.arange(n_hours, dtype=float)
-    return pd.DataFrame({"wind_DE_LU_MW": pos, "solar_DE_LU_MW": 2 * pos, "price_SE_3_EUR_MWh": 3 * pos}, index=idx)
+    return pd.DataFrame({"wind_DE_LU_MW": pos, "solar_DE_LU_MW": 2 * pos, "load_NO_1_MW": 4 * pos,
+                         "price_SE_3_EUR_MWh": 3 * pos}, index=idx)
 
 
 def test_wind_solar_frames_are_normalised_to_hourly_zone_columns():
@@ -398,6 +395,19 @@ def test_wind_solar_frames_are_normalised_to_hourly_zone_columns():
         assert str(out.index.tz) == TZ
 
 
+def test_load_forecast_frames_are_normalised_to_hourly_load_column():
+    """entsoe-py load forecast (DataFrame or Series, 15-min) -> hourly load_<zone>_MW in Europe/Oslo."""
+    import exog as X
+
+    idx = pd.date_range("2026-01-01", periods=8, freq="15min", tz="Europe/Oslo")
+    values = [100.0, 200.0, 300.0, 400.0, 10.0, 20.0, 30.0, 40.0]
+    for raw in (pd.DataFrame({"Forecasted Load": values}, index=idx), pd.Series(values, index=idx)):
+        out = X.normalise_load(raw, "NO_1")
+        assert list(out.columns) == ["load_NO_1_MW"] and str(out.index.tz) == TZ
+        assert out["load_NO_1_MW"].tolist() == [250.0, 25.0]
+    assert X.split_columns(["load_NO_1_MW", "price_SE_3_EUR_MWh"]) == (["load_NO_1_MW"], ["price_SE_3_EUR_MWh"])
+
+
 def test_exog_availability_follows_the_day_ahead_schedule():
     """Origin 23:00 on D: tomorrow (h 1-24) is published, the day after (h 25-48) is not."""
     import exog as X
@@ -412,7 +422,7 @@ def test_exog_availability_follows_the_day_ahead_schedule():
 
 
 def test_exog_features_have_no_look_ahead():
-    """Unpublished target hours are NaN; neighbour prices come from the origin and 24 h before only."""
+    """Unpublished target hours (wind/solar/load) are NaN; neighbour prices come from the origin and 24 h before only."""
     import exog as X
 
     ex = _exog_frame()
@@ -421,13 +431,15 @@ def test_exog_features_have_no_look_ahead():
     f30 = X.exog_features(ex, origin, 30)
 
     assert f24["wind_DE_LU_MW_target"].iloc[0] == ex["wind_DE_LU_MW"].loc[origin[0] + pd.Timedelta(hours=24)]
+    assert f24["load_NO_1_MW_target"].iloc[0] == ex["load_NO_1_MW"].loc[origin[0] + pd.Timedelta(hours=24)]
+    assert np.isnan(f30["load_NO_1_MW_target"].iloc[0])
     assert np.isnan(f30["wind_DE_LU_MW_target"].iloc[0]) and np.isnan(f30["solar_DE_LU_MW_target"].iloc[0])
     assert f30["price_SE_3_EUR_MWh_origin"].iloc[0] == ex["price_SE_3_EUR_MWh"].loc[origin[0]]
     assert f30["price_SE_3_EUR_MWh_origin_lag24h"].iloc[0] == ex["price_SE_3_EUR_MWh"].loc[origin[0] - pd.Timedelta(hours=24)]
 
     tampered = ex.copy()  # change prices after the origin and wind in the unpublished hours
     tampered.loc[tampered.index > origin[0], "price_SE_3_EUR_MWh"] = -999.0
-    tampered.loc[tampered.index > origin[0] + pd.Timedelta(hours=24), "wind_DE_LU_MW"] = -999.0
+    tampered.loc[tampered.index > origin[0] + pd.Timedelta(hours=24), ["wind_DE_LU_MW", "load_NO_1_MW"]] = -999.0
     pd.testing.assert_frame_equal(X.exog_features(tampered, origin, 30), f30)
 
 
@@ -442,11 +454,11 @@ def test_assemble_appends_exog_features_after_price_and_weather():
     weather = _weather_frame(price.index)
     origins = price.index[100:103]
 
-    X0 = F.assemble(history, origins, 6, "int")
-    X1 = F.assemble(history, origins, 6, "int", weather=weather, exog=ex)
+    X0 = F.assemble(history, origins, 6)
+    X1 = F.assemble(history, origins, 6, weather=weather, exog=ex)
     assert list(X1.columns) == (list(X0.columns) + ["temperature_C_target", "wind_speed_ms_target"]
                                 + X.feature_names(ex.columns))
-    assert list(F.assemble(history, origins, 6, "int", exog=ex).columns)[len(X0.columns):] == X.feature_names(ex.columns)
+    assert list(F.assemble(history, origins, 6, exog=ex).columns)[len(X0.columns):] == X.feature_names(ex.columns)
 
 
 def test_exog_fetch_skips_failing_zones_and_fails_when_nothing_arrives():
@@ -464,9 +476,14 @@ def test_exog_fetch_skips_failing_zones_and_fails_when_nothing_arrives():
         def query_day_ahead_prices(self, zone, start, end):
             return pd.Series(50.0, index=idx)
 
+        def query_load_forecast(self, zone, start, end):
+            return pd.DataFrame({"Forecasted Load": 4000.0}, index=idx)
+
     chunks = [(pd.Timestamp("2026-01-01", tz="Europe/Brussels"), pd.Timestamp("2026-01-02", tz="Europe/Brussels"))]
-    df = FX.fetch_all(Fake(), ["DE_LU", "BAD"], ["NO_2"], chunks, retries=1, sleep=0)
-    assert sorted(df.columns) == ["price_NO_2_EUR_MWh", "solar_DE_LU_MW", "wind_DE_LU_MW"]
+    df = FX.fetch_all(Fake(), ["DE_LU", "BAD"], ["NO_2"], chunks, retries=1, sleep=0, load_zones=["NO_1"])
+    assert sorted(df.columns) == ["load_NO_1_MW", "price_NO_2_EUR_MWh", "solar_DE_LU_MW", "wind_DE_LU_MW"]
+    assert (df["load_NO_1_MW"].dropna() == 4000.0).all() and str(df.index.tz) == TZ
+    assert FX.zone_columns("load", "NO_1") == ["load_NO_1_MW"]
 
     class Empty(Fake):
         def query_wind_and_solar_forecast(self, zone, start, end):
@@ -482,6 +499,151 @@ def test_exog_fetch_skips_failing_zones_and_fails_when_nothing_arrives():
     raise AssertionError("expected RuntimeError when no zone returns data")
 
 
+def _nwp_frame(n_hours: int = 24 * 12) -> pd.DataFrame:
+    """NWP columns <base>_d<N> whose value encodes the lead N (N*1000 + hour index)."""
+    idx = pd.date_range("2026-03-01", periods=n_hours, freq="h", tz=TZ)
+    pos = np.arange(n_hours, dtype=float)
+    return pd.DataFrame({f"nwp_wind_DE_d{n}": n * 1000 + pos for n in (1, 2, 3, 4)}, index=idx)
+
+
+def test_nwp_lead_follows_the_decision_time():
+    """Decision 14:00 on D, origin 23:00 on D+1 (lag 33), 6 h margin: D+2 00-08 use the
+    2-day-old run, D+2 09:00 onward the 3-day-old run, D+3 late hours the 4-day-old run."""
+    import nwp as N
+
+    o = pd.DatetimeIndex([pd.Timestamp("2026-03-05 23:00", tz=TZ)])
+    lead = {h: int(N.lead_days(o, h, 33)[0]) for h in (1, 9, 10, 33, 34, 48)}
+    assert lead == {1: 2, 9: 2, 10: 3, 33: 3, 34: 4, 48: 4}
+    assert int(N.lead_days(o, 1, 11)[0]) == 1 and int(N.lead_days(o, 24, 11)[0]) == 2
+
+
+def test_nwp_features_use_only_runs_available_at_the_decision_time():
+    import nwp as N
+
+    nwp = _nwp_frame()
+    o = pd.DatetimeIndex([pd.Timestamp("2026-03-05 23:00", tz=TZ)])
+    pos = int((o[0] - nwp.index[0]) / pd.Timedelta(hours=1))
+    f10 = N.nwp_features(nwp, o, 10, 33)
+    assert list(f10.columns) == ["nwp_wind_DE_target"]
+    assert f10.iloc[0, 0] == 3000 + pos + 10                        # 3-day-old run at the target hour
+
+    tampered = nwp.copy()                                            # newer runs must not matter
+    tampered[["nwp_wind_DE_d1", "nwp_wind_DE_d2"]] = -999.0
+    pd.testing.assert_frame_equal(N.nwp_features(tampered, o, 10, 33), f10)
+    assert np.isnan(N.nwp_features(nwp[["nwp_wind_DE_d1"]], o, 48, 33).iloc[0, 0])  # lead 4 missing -> NaN
+    assert N.bases(nwp.columns) == ["nwp_wind_DE"]
+
+
+def test_openmeteo_response_is_parsed_into_group_means():
+    """One JSON object per point (list, request order) -> <base>_d<N> group means; errors raise."""
+    import fetch_openmeteo as FO
+
+    t = [1772323200, 1772326800]                                     # two hours, unix seconds
+    items = []
+    for i, (lat, lon) in enumerate(FO._points()):
+        hourly = {"time": t}
+        for v in FO._variables():
+            for n in FO.LEADS:
+                hourly[f"{v}_previous_day{n}"] = [float(i), float(i) + n]
+        items.append({"latitude": lat, "longitude": lon, "hourly": hourly})
+    df = FO.parse_response(items)
+    assert len(df) == 2 and str(df.index.tz) == TZ
+    assert set(df.columns) == {f"{b}_d{n}" for b in FO.GROUPS for n in FO.LEADS}
+    pts = FO._points()
+    de = [pts.index(p) for p in FO.GROUPS["nwp_wind_DE"][1]]
+    assert df["nwp_wind_DE_d2"].iloc[1] == np.mean(de) + 2
+    try:
+        FO.parse_response({"error": True, "reason": "bad model"})
+    except RuntimeError as exc:
+        assert "bad model" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for an API error")
+
+
+def test_reanalysis_fills_only_the_years_before_the_forecast_archive():
+    """ERA5 values fill each lead column before its first archived forecast; forecasts and
+    later gaps are left untouched."""
+    import fetch_openmeteo as FO
+
+    t = [1700000000, 1700003600, 1700007200]
+    items = [{"hourly": {"time": t, **{v: [1.0, 2.0, 3.0] for v in FO._variables()}}} for _ in FO._points()]
+    rean = FO.parse_reanalysis(items)
+    assert set(rean.columns) == set(FO.GROUPS) and len(rean) == 3
+
+    idx = rean.index
+    fc = pd.DataFrame({"nwp_wind_DE_d1": [np.nan, 20.0, np.nan], "nwp_wind_DE_d2": [np.nan, np.nan, 30.0]}, index=idx)
+    out = FO.fill_before_archive(fc, rean)
+    assert np.isnan(out["nwp_wind_DE_d1"].iloc[2])                     # gap after the archive start stays
+    assert out["nwp_wind_DE_d1"].iloc[:2].tolist() == [1.0, 20.0]
+    assert out["nwp_wind_DE_d2"].tolist() == [1.0, 2.0, 30.0]
+
+
+def test_decision_lag_moves_exog_availability_and_nwp_columns_follow_exog():
+    """Lag 33 (forecast D+2/D+3 after the auction): ENTSO-E day-ahead values for D+2 are not
+    published at 14:00 on D, neighbour prices at the origin are; NWP columns come last."""
+    import exog as X
+    import nwp as N
+
+    price = synthetic_price()
+    history = F.history_features(price)
+    ex = _exog_frame()
+    ex.index = price.index[: len(ex)]
+    nwp = _nwp_frame()
+    nwp.index = price.index[: len(nwp)]
+    origins = price.index[100:101]
+    X33 = F.assemble(history, origins, 1, exog=ex, nwp=nwp, decision_lag_h=33)
+    assert np.isnan(X33["wind_DE_LU_MW_target"].iloc[0]) and not np.isnan(X33["price_SE_3_EUR_MWh_origin"].iloc[0])
+    X11 = F.assemble(history, origins, 1, exog=ex, nwp=nwp)
+    assert not np.isnan(X11["wind_DE_LU_MW_target"].iloc[0])
+    assert list(X33.columns)[-1:] == N.feature_names(["nwp_wind_DE"])
+    assert list(X33.columns) == list(X11.columns)
+
+
+def test_target_anchors_use_only_known_prices_and_round_trip():
+    """Every anchor uses prices at or before the origin; to_price(to_target(y)) == y."""
+    import targets as T
+
+    price = synthetic_price()
+    origins = price.index[400:405]
+    for mode in T.MODES:
+        for h in (1, 24, 25, 48):
+            off, sc = T.anchor(price, origins, h, mode)
+            tampered = price.copy()
+            tampered.loc[tampered.index > origins[-1]] = 999.0       # prices after the last origin
+            off2, sc2 = T.anchor(tampered, origins, h, mode)
+            assert np.allclose(off, off2) and np.allclose(sc, sc2), (mode, h)
+            y = price.reindex(origins + pd.Timedelta(hours=h)).to_numpy()
+            assert np.allclose(T.to_price(T.to_target(y, off, sc), off, sc), y)
+    # same clock hour on the last known day: h=5 -> t-24, h=30 -> t-48
+    o = origins[:1]
+    assert T.anchor(price, o, 5, "diff_sameh")[0][0] == price.loc[o[0] + pd.Timedelta(hours=5 - 24)]
+    assert T.anchor(price, o, 30, "diff_sameh")[0][0] == price.loc[o[0] + pd.Timedelta(hours=30 - 48)]
+    assert np.isclose(T.anchor(price, o, 5, "diff_mean24")[0][0], price.loc[:o[0]].iloc[-24:].mean())
+    X = T.add_features(pd.DataFrame(index=o), *T.anchor(price, o, 5, "rel_mean24"), "rel_mean24")
+    assert list(X.columns) == ["target_anchor", "target_scale"]
+    assert list(T.add_features(pd.DataFrame(index=o), *T.anchor(price, o, 5, "level"), "level").columns) == []
+
+
+def test_eurnok_rates_parse_and_fall_back_to_the_fixed_rate():
+    """Norges Bank sdmx-json is parsed; weekends use the last business day; stale or
+    missing data falls back to config.EUR_TO_NOK."""
+    import fx as FXR
+    from config import EUR_TO_NOK
+
+    payload = {"data": {
+        "dataSets": [{"series": {"0:0:0:0": {"observations": {"0": ["11.50"], "1": ["11.60"]}}}}],
+        "structure": {"dimensions": {"series": [], "observation": [
+            {"id": "TIME_PERIOD", "values": [{"id": "2026-11-19"}, {"id": "2026-11-20"}]}]}},
+    }}
+    r = FXR.parse_sdmx_json(payload)
+    assert r.tolist() == [11.5, 11.6] and str(r.index[1].date()) == "2026-11-20"
+    assert FXR.rate_on(pd.Timestamp("2026-11-22 14:00", tz=TZ), r) == (11.6, "Norges Bank 2026-11-20")
+    assert FXR.rate_on("2026-12-15", r)[0] == EUR_TO_NOK                  # older than MAX_AGE_DAYS
+    assert FXR.rate_on("2026-11-22", None)[0] == EUR_TO_NOK                # no file
+    ts = pd.DatetimeIndex(["2026-11-19 23:00", "2026-11-21 12:00", "2026-11-01 00:00"]).tz_localize(TZ)
+    assert FXR.rates_for(ts, r).tolist() == [11.5, 11.6, EUR_TO_NOK]
+
+
 def test_exog_incremental_start_and_merge():
     import fetch_entsoe_exog as FX
 
@@ -495,6 +657,9 @@ def test_exog_incremental_start_and_merge():
     assert inc == pd.Timestamp("2026-11-07", tz="Europe/Brussels")                   # last - 3 days
     late = old.loc["2024-01-01":]
     assert FX.zone_start(late, "price", "NO_2", start) == start                      # backfill needed
+    gap = old.copy()
+    gap.loc[:"2021-12-01", "solar_DE_LU_MW"] = float("nan")                          # solar starts late at the source
+    assert FX.zone_start(gap, "wind_solar", "DE_LU", start, overlap_days=3) == inc   # still incremental
     new = pd.DataFrame({"price_NO_2_EUR_MWh": 9.0},
                        index=pd.date_range("2026-11-10", "2026-11-12 23:00", freq="h", tz=tz))
     m = FX.merge_exog(old, new)

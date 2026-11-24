@@ -3,7 +3,7 @@
 A feature (or a group of related features) is shuffled and the increase in MAE
 is recorded, averaged over several repeats.
 
-    python src/feature_importance.py --model_dir models/lgbm_int models/ridge_ohe_both
+    python src/feature_importance.py --model_dir models/lgbm
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from joblib import load
 import features as F
 import models as M
 from config import EUR_TO_NOK, ROOT, TZ, repo_path
-from plotting import INK, INK_SOFT, save_figure
+from plotting import INK, INK_SOFT, fixed_rate_note, save_figure
 
 DEFAULT_INPUT = "data/features_price_only.parquet"
 UNIT = "NOK/kWh"
@@ -34,9 +34,9 @@ SEQ_BLUE = matplotlib.colors.LinearSegmentedColormap.from_list(
 )
 
 
-def feature_groups(columns: list[str], encoding: str) -> dict[str, list[str]]:
+def feature_groups(columns: list[str]) -> dict[str, list[str]]:
     """Groups of related features."""
-    cal = set(F.calendar_columns(encoding))
+    cal = set(F.calendar_columns())
     groups = {
         "Origin price (lag0h)": ["lag0h"],
         "Short lags (1-12 h)": [f"lag{h}h" for h in F.LAGS_H if h < 24],
@@ -71,9 +71,9 @@ def evaluation_set(df: pd.DataFrame, payload: dict, meta: dict, eval_start: str 
         start = pd.Timestamp(meta["val_start"]).tz_convert(TZ)
 
     rows = df.index[(df.index >= start) & df[target].notna()]
-    X = F.assemble(df[F.history_columns()], rows, h, payload["encoding"])
+    X = F.assemble(df[F.history_columns()], rows, h)
     X = X.loc[:, payload["features"]]
-    X = M.prepare_X(payload["model"], X, payload["encoding"])
+    X = M.prepare_X(X)
     y = df.loc[rows, target].to_numpy(dtype=float)
     return X, y, start
 
@@ -125,7 +125,7 @@ def plot_group_heatmap(groups: pd.DataFrame, tag: str, out: Path) -> None:
     cbar.outline.set_visible(False)
     ax.set_xlabel("Forecast horizon", color=INK_SOFT)
     ax.set_title(f"Group permutation importance, {tag}", loc="left", color=INK, fontsize=12, pad=10)
-    save_figure(fig, out)
+    save_figure(fig, out, note=fixed_rate_note())
 
 
 def run_model(model_dir: Path, df: pd.DataFrame, args) -> None:
@@ -141,7 +141,7 @@ def run_model(model_dir: Path, df: pd.DataFrame, args) -> None:
             payload["estimator"], X, y, {c: [c] for c in cols}, args.repeats, args.seed + h
         )
         _, grouped = permutation_importance(
-            payload["estimator"], X, y, feature_groups(cols, payload["encoding"]), args.repeats, args.seed + h
+            payload["estimator"], X, y, feature_groups(cols), args.repeats, args.seed + h
         )
 
         for c in cols:
@@ -173,7 +173,7 @@ def run_model(model_dir: Path, df: pd.DataFrame, args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Permutation feature importance for trained models")
-    ap.add_argument("--model_dir", nargs="+", required=True, help="One or more models/<model>_<encoding> dirs")
+    ap.add_argument("--model_dir", nargs="+", required=True, help="One or more model dirs, e.g. models/lgbm")
     ap.add_argument("--inp", default=DEFAULT_INPUT, help="Feature parquet written by build_features.py")
     ap.add_argument("--horizons", type=int, nargs="+", default=[1, 6, 12, 24, 36, 48])
     ap.add_argument("--repeats", type=int, default=10)

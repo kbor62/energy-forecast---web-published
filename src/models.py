@@ -1,29 +1,16 @@
-"""Model definitions."""
+"""Model definition: one LightGBM regressor per horizon."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Ridge, RidgeCV
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 import features as F
 
 import lightgbm
 from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 
-MODELS = ("lgbm", "ridge", "ridge_ohe")
-
-# Default calendar encoding per model.
-DEFAULT_ENCODING = {
-    "lgbm": "int",
-    "ridge": "trig",
-    "ridge_ohe": "both",
-}
+MODEL_NAME = "lgbm"
 
 LGBM_PARAMS = dict(
     n_estimators=3000,
@@ -39,71 +26,26 @@ LGBM_PARAMS = dict(
 )
 
 
-def _one_hot_encoder(cat_cols: list[str]) -> OneHotEncoder:
-    """One-hot encoder with fixed category levels."""
-    categories = [F.CAT_LEVELS[c] for c in cat_cols]
-    return OneHotEncoder(categories=categories, handle_unknown="ignore", sparse_output=False)
+def build_estimator(seed: int = 42) -> LGBMRegressor:
+    """Return an unfitted LightGBM regressor. Missing values (e.g. weather) are handled natively."""
+    return LGBMRegressor(random_state=seed, **LGBM_PARAMS)
 
 
-def build_estimator(model: str, encoding: str, alpha="auto", seed: int = 42, extra_cols=()):
-    """Return an unfitted estimator for ``model``.
-
-    ``extra_cols``: additional numeric feature columns (e.g. weather ``*_target``);
-    without them the ridge models would silently drop those columns.
-    """
-    cat_cols = F.categorical_columns(encoding)
-    num_cols = [c for c in F.feature_columns(encoding) if c not in cat_cols] + list(extra_cols)
-
-    if model == "lgbm":
-        # No imputer: LightGBM handles missing values itself.
-        return LGBMRegressor(random_state=seed, **LGBM_PARAMS)
-
-    # Ridge: impute and scale the numeric columns only.
-    numeric = Pipeline(
-        [("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
-    )
-
-    if model == "ridge_ohe":
-        pre = ColumnTransformer(
-            [("cat", _one_hot_encoder(cat_cols), cat_cols), ("num", numeric, num_cols)],
-            remainder="drop",
-        )
-    else:
-        pre = ColumnTransformer([("num", numeric, num_cols)], remainder="drop")
-
-    if str(alpha).lower() == "auto":
-        estimator = RidgeCV(alphas=np.logspace(-3, 3, 25), cv=TimeSeriesSplit(n_splits=3))
-    else:
-        estimator = Ridge(alpha=float(alpha))
-
-    return Pipeline([("pre", pre), ("model", estimator)])
-
-
-def prepare_X(model: str, X: pd.DataFrame, encoding: str) -> pd.DataFrame:
-    """LightGBM reads calendar columns as category dtype; the others as integers."""
-    if model == "lgbm":
-        return F.as_categorical(X, F.categorical_columns(encoding))
-    return X
+def prepare_X(X: pd.DataFrame) -> pd.DataFrame:
+    """LightGBM reads hour and dow as categorical (pandas category dtype)."""
+    return F.as_categorical(X)
 
 
 def fit_estimator(
-    model: str,
-    estimator,
+    estimator: LGBMRegressor,
     X: pd.DataFrame,
     y: np.ndarray,
     min_val_hours: int = 24 * 14,
     val_fraction: float = 0.1,
 ) -> dict:
-    """Fit the estimator. LightGBM uses the last 10 % of rows for early stopping."""
+    """Fit the estimator, using the last 10 % of rows for early stopping."""
     y = np.asarray(y, dtype=float)
     info: dict = {"n_train_rows": int(len(X))}
-
-    if model != "lgbm":
-        estimator.fit(X, y)
-        inner = getattr(estimator, "named_steps", {}).get("model")
-        if hasattr(inner, "alpha_"):
-            info["alpha"] = float(inner.alpha_)
-        return info
 
     n = len(X)
     n_val = max(min_val_hours, int(val_fraction * n))
@@ -124,13 +66,14 @@ def fit_estimator(
 
 def library_versions() -> dict[str, str]:
     """Library versions, written to output metadata."""
+    import holidays
     import sklearn
 
-    versions = {
+    return {
         "python": __import__("platform").python_version(),
         "pandas": pd.__version__,
         "numpy": np.__version__,
         "scikit-learn": sklearn.__version__,
         "lightgbm": lightgbm.__version__,
+        "holidays": holidays.__version__,
     }
-    return versions

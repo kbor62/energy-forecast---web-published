@@ -1,7 +1,7 @@
 """Paired test of weather vs no weather per time-of-day block.
 
 Compares two rolling backtests of the same model on the same origins (e.g.
-backtest_rolling_lgbm_int.csv and backtest_rolling_lgbm_int_wx.csv). For each block
+backtest_rolling_lgbm.csv and backtest_rolling_lgbm_wx.csv). For each block
 of target hours the MAE is computed per forecast origin, and the paired difference
 (weather minus no weather) is summarised with a block-bootstrap 95 % CI, the share of
 origins where weather is better, and a Wilcoxon signed-rank p-value.
@@ -11,8 +11,8 @@ Blocks (fixed in advance, Europe/Oslo clock hours of the TARGET hour):
   secondary  00-05, 06-09, 10-15, 16-20, 21-23; exploratory, Holm over these five
   all        all 24 hours
 
-    python src/weather_block_test.py data/backtest_rolling_lgbm_int.csv data/backtest_rolling_lgbm_int_wx.csv
-    python src/weather_block_test.py BASE.csv WEATHER.csv --out_csv data/weather_block_test_lgbm_int.csv
+    python src/weather_block_test.py data/backtest_rolling_lgbm.csv data/backtest_rolling_lgbm_wx.csv
+    python src/weather_block_test.py BASE.csv WEATHER.csv --out_csv data/weather_block_test_lgbm.csv
 
 Note: with --weather_mode observed the weather is OBSERVED, so the gain is an upper bound.
 """

@@ -10,7 +10,7 @@ at training time by ``features.assemble``.
 Weather forecast mode (--add-weather-forecast) - LEGACY:
     The extra <col>_at_t{h}h columns are NOT read by train.py (it selects only the
     price-history columns), so a model trained from this file ignores them. Weather
-    is added at training time with train.py --weather_file instead (README 13).
+    is added at training time with train.py --weather_file instead (README 6.4).
     Kept for reference.
 
     For each horizon h (1..48), adds the weather VALUE at t+h as a feature.
